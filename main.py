@@ -22,9 +22,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "632701533:AAEmKI2F4uyoB7-q5ga-Yc5EHnGjCCAlpeE"
-ADMIN_ID = 7825563654
-ADMIN_USERNAME = "Bexr7zz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -290,6 +290,7 @@ async def is_bot_admin(user_id: int) -> bool:
         return (await cur.fetchone()) is not None
 
 def md_escape(text) -> str:
+    """Telegram Markdown v1 uchun maxsus belgilarni escape qiladi."""
     if text is None:
         return ""
     text = str(text)
@@ -511,14 +512,13 @@ async def build_subscription_keyboard(unsub) -> InlineKeyboardMarkup:
     buttons = []
     for ch_id, link, title, ch_type in unsub:
         if ch_type in ("bot", "instagram", "manual"):
-            row = []
             icon = "🤖" if ch_type == "bot" else ("📸" if ch_type == "instagram" else "🔗")
             if link:
-                row.append(InlineKeyboardButton(text=f"{icon} {title}", url=link))
-            row.append(InlineKeyboardButton(
-                text="✅ Bosdim", callback_data=f"confirm_manual_{ch_id}"
-            ))
-            buttons.append(row)
+                buttons.append([InlineKeyboardButton(text=f"{icon} {title}", url=link)])
+            else:
+                buttons.append([InlineKeyboardButton(
+                    text=f"{icon} {title}", callback_data="noop"
+                )])
         else:
             real_link = await get_channel_link(ch_id, link)
             if real_link:
@@ -656,7 +656,37 @@ async def start_cmd(message: types.Message):
                 )
                 await db.commit()
 
-    if await is_premium_user(user_id):
+    is_prem = await is_premium_user(user_id)
+
+    # Deep-link orqali media kodi yuborilgan bo'lsa (masalan t.me/bot?start=1234)
+    if payload and not payload.startswith("ref_") and not is_prem:
+        # Avval obunani tekshiramiz
+        unsub = await check_subscriptions(user_id)
+        if unsub:
+            kb = await build_subscription_keyboard(unsub)
+            await message.answer(
+                "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo'ling:\n\n"
+                "ℹ️ _Premium a'zolarga majburiy kanal obunasi talab qilinmaydi!_",
+                reply_markup=kb, parse_mode="Markdown"
+            )
+            return
+        # Obuna mavjud — mediani yuboramiz
+        await message.answer(
+            "Xush kelibsiz! Kerakli bo'limni tanlang:",
+            reply_markup=main_menu(user_id)
+        )
+        await deliver_media_by_code(message, user_id, payload.strip())
+        return
+
+    if payload and not payload.startswith("ref_") and is_prem:
+        await message.answer(
+            "Xush kelibsiz! Kerakli bo'limni tanlang:",
+            reply_markup=main_menu(user_id)
+        )
+        await deliver_media_by_code(message, user_id, payload.strip())
+        return
+
+    if is_prem:
         await message.answer(
             "Xush kelibsiz! Kerakli bo'limni tanlang:",
             reply_markup=main_menu(user_id)
@@ -681,37 +711,51 @@ async def start_cmd(message: types.Message):
 async def noop_cb(call: types.CallbackQuery):
     await call.answer("🔒 Bu maxfiy kanal. Admin orqali qo'shiling.", show_alert=True)
 
-@dp.callback_query(F.data.startswith("confirm_manual_"))
-async def confirm_manual_cb(call: types.CallbackQuery):
-    ch_id = call.data[len("confirm_manual_"):]
-    db = await get_db()
-    await db.execute(
-        "INSERT OR REPLACE INTO manual_confirmations (user_id, channel_id, confirmed_at) "
-        "VALUES (?, ?, ?)",
-        (call.from_user.id, ch_id, datetime.now().isoformat())
-    )
-    await db.commit()
-    await call.answer(
-        "✅ Belgilandi! Endi \"Tekshirish\" tugmasini bosing.", show_alert=True
-    )
-
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_cb(call: types.CallbackQuery):
-    if await is_premium_user(call.from_user.id):
+    user_id = call.from_user.id
+    if await is_premium_user(user_id):
         try:
             await call.message.delete()
         except Exception:
             pass
         await call.message.answer(
             "✅ Siz Premium a'zosiz! Menyudan foydalanishingiz mumkin:",
-            reply_markup=main_menu(call.from_user.id)
+            reply_markup=main_menu(user_id)
         )
         return
-    unsub = await check_subscriptions(call.from_user.id)
+
+    # "Bosdim" tugmasi yo'q — "Tekshirish" bosilganda bot/instagram/manual
+    # kanallarni avtomatik tasdiqlaymiz (ularni API orqali tekshirib bo'lmaydi)
+    db = await get_db()
+    async with db.execute("SELECT channel_id, type FROM channels") as cur:
+        all_channels = await cur.fetchall()
+    for ch in all_channels:
+        if ch["type"] in ("bot", "instagram", "manual"):
+            await db.execute(
+                "INSERT OR REPLACE INTO manual_confirmations "
+                "(user_id, channel_id, confirmed_at) VALUES (?, ?, ?)",
+                (user_id, ch["channel_id"], datetime.now().isoformat())
+            )
+    await db.commit()
+
+    unsub = await check_subscriptions(user_id)
     if unsub:
-        await call.answer(
-            "❌ Hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True
-        )
+        # Faqat qolgan (hali obuna bo'linmagan) kanallarni ko'rsat
+        kb = await build_subscription_keyboard(unsub)
+        try:
+            await call.message.edit_text(
+                "⚠️ Quyidagi kanal(lar)ga hali obuna bo'lmadingiz:\n\n"
+                "ℹ️ _Premium a'zolarga majburiy kanal obunasi talab qilinmaydi!_",
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await call.message.answer(
+                "⚠️ Quyidagi kanal(lar)ga hali obuna bo'lmadingiz:",
+                reply_markup=kb
+            )
+        await call.answer("❌ Hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
     else:
         try:
             await call.message.delete()
@@ -719,8 +763,9 @@ async def check_sub_cb(call: types.CallbackQuery):
             pass
         await call.message.answer(
             "✅ Obuna tasdiqlandi! Menyudan foydalanishingiz mumkin:",
-            reply_markup=main_menu(call.from_user.id)
+            reply_markup=main_menu(user_id)
         )
+        await call.answer()
 
 
 # ─── MEDIA YETKAZIB BERISH ───────────────────────────────────────────────────
@@ -1837,7 +1882,8 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
             "group": "👥 Guruh",
             "supergroup": "👥 Guruh (supergroup)"
         }.get(ch_type_detected, "Chat")
-        uname_str = uname if uname else "_(username yo'q)_"
+        # username da _ belgisi bo'lsa Markdown uni kursivga aylantiradi — escape qilamiz
+        uname_str = md_escape(uname) if uname else "_(username yo'q)_"
 
         await message.answer(
             f"✅ *Aniqlandi!*\n\n"
@@ -1907,7 +1953,7 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
         await message.answer(
             f"✅ *Telegram bot qo'shildi!*\n\n"
             f"🤖 Nomi: *{md_escape(title)}*\n"
-            f"👤 Username: @{uname}\n"
+            f"👤 Username: @{md_escape(uname)}\n"
             f"🔗 Havola: {link if link else '_(yo`q)_'}\n\n"
             f"ℹ️ Foydalanuvchilar botga o'tib, keyin "
             f"\"✅ Bosdim\" tugmasini bosib tasdiqlaydi.",
@@ -1982,7 +2028,6 @@ async def add_channel_finish(message: types.Message, state: FSMContext):
         f"📢 Nomi: *{md_escape(title)}*\n"
         f"🆔 ID: `{ch_id}`\n"
         f"🔗 Havola: {link}",
-        parse_mode="Markdown",
         reply_markup=admin_menu(message.from_user.id)
     )
 
@@ -2114,9 +2159,10 @@ async def list_channels(message: types.Message, state: FSMContext):
     for ch in channels:
         icon = type_icons.get(ch["type"], "🔗")
         link_str = ch["link"] or "_(havola yo'q)_"
+        ch_id_str = md_escape(str(ch["channel_id"]))
         text += (
             f"{icon} *{md_escape(ch['title'])}*\n"
-            f"  🆔 `{ch['channel_id']}`\n"
+            f"  🆔 `{ch_id_str}`\n"
             f"  🔗 {link_str}\n\n"
         )
     await message.answer(text, parse_mode="Markdown")
@@ -2334,6 +2380,42 @@ async def cmd_premium(message: types.Message):
     await premium_info(message)
 
 
+# ─── TANILMAGAN XABARLAR (CATCH-ALL) ─────────────────────────────────────────
+
+@dp.message(StateFilter(None))
+async def unknown_message(message: types.Message):
+    """
+    Hech qaysi handlerga tushmaydigan har qanday xabarga darhol javob beradi.
+    Foydalanuvchi biror matn yoki fayl yuborganda bot sukunatda qolmaydi.
+    """
+    user_id = message.from_user.id
+
+    # Admin bo'lsa — admin menyusini ko'rsat
+    if await is_bot_admin(user_id):
+        await message.answer(
+            "ℹ️ Noma'lum buyruq. Menyudan foydalaning:",
+            reply_markup=admin_menu(user_id)
+        )
+        return
+
+    # Obunasiz foydalanuvchi
+    if not await is_premium_user(user_id):
+        unsub = await check_subscriptions(user_id)
+        if unsub:
+            kb = await build_subscription_keyboard(unsub)
+            await message.answer(
+                "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo'ling:",
+                reply_markup=kb
+            )
+            return
+
+    # Oddiy foydalanuvchi — asosiy menyuni ko'rsat
+    await message.answer(
+        "ℹ️ Noma'lum buyruq. Quyidagi menyudan foydalaning:",
+        reply_markup=main_menu(user_id)
+    )
+
+
 # ─── ISHGA TUSHIRISH ─────────────────────────────────────────────────────────
 
 async def set_commands():
@@ -2380,16 +2462,21 @@ async def run_bot():
     asyncio.create_task(premium_checker())
     asyncio.create_task(backup_scheduler())
 
+    first_start = True
     while True:
         try:
             logging.info("Bot ishga tushmoqda (polling)...")
             await dp.start_polling(
                 bot,
-                allowed_updates=dp.resolve_used_update_types()
+                allowed_updates=dp.resolve_used_update_types(),
+                # Birinchi ishga tushganda eski (kutib qolgan) xabarlarni o'tkazib yuboramiz
+                drop_pending_updates=first_start,
             )
         except Exception as e:
             logging.error(f"Polling to'xtadi: {e}. 5 soniyadan keyin qayta urinaladi...")
             await asyncio.sleep(5)
+        finally:
+            first_start = False
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
