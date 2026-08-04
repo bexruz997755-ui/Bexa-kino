@@ -22,9 +22,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "632701533:AAEDh4KuUcllRmHLBcewG89t6482niX2RkU"
-ADMIN_ID = 7825563654
-ADMIN_USERNAME = "Bexr7zz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -41,8 +41,14 @@ dp = Dispatcher(storage=MemoryStorage())
 
 _db: aiosqlite.Connection = None
 
+
 async def get_db() -> aiosqlite.Connection:
+    global _db
+    if _db is None:
+        _db = await aiosqlite.connect(DB_PATH)
+        _db.row_factory = aiosqlite.Row
     return _db
+
 
 async def init_db():
     global _db
@@ -90,10 +96,7 @@ async def init_db():
     await _db.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        first_seen TEXT,
-        balance INTEGER DEFAULT 0,
-        referred_by INTEGER,
-        last_daily_bonus TEXT
+        first_seen TEXT
     )""")
 
     await _db.execute("""
@@ -126,9 +129,6 @@ async def init_db():
         "ALTER TABLE media ADD COLUMN dislikes INTEGER DEFAULT 0",
         "ALTER TABLE premium_users ADD COLUMN expire_date TEXT",
         "ALTER TABLE premium_users ADD COLUMN notified INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN referred_by INTEGER",
-        "ALTER TABLE users ADD COLUMN last_daily_bonus TEXT",
         "ALTER TABLE channels ADD COLUMN type TEXT DEFAULT 'telegram'",
     ]
     for sql in migrations:
@@ -168,10 +168,10 @@ class CodeSearch(StatesGroup):
 class AdminChannel(StatesGroup):
     waiting_for_type = State()
     waiting_for_id = State()
-    waiting_for_link = State()
     waiting_for_manual_title = State()
     waiting_for_manual_link = State()
     waiting_for_invite_title = State()
+    waiting_for_invite_resolve = State()
 
 class AdminDeleteMedia(StatesGroup):
     waiting_for_code = State()
@@ -262,22 +262,21 @@ async def safe_get_chat(chat_id):
         logging.error(f"get_chat xato ({chat_id}): {e}")
         return None
 
-async def get_channel_link(ch_id: str, link: str):
-    if link:
-        return link
-    try:
-        chat_id_int = int(ch_id) if str(ch_id).lstrip("-").isdigit() else ch_id
-        invite = await asyncio.wait_for(
-            bot.create_chat_invite_link(chat_id_int),
-            timeout=API_TIMEOUT
-        )
-        db = await get_db()
-        await db.execute("UPDATE channels SET link=? WHERE channel_id=?", (invite.invite_link, ch_id))
-        await db.commit()
-        return invite.invite_link
-    except Exception as e:
-        logging.error(f"Kanal ({ch_id}) uchun invite link yaratib bo'lmadi: {e}")
-        return None
+async def get_channel_link(ch_id: str, link: str) -> str:
+    """
+    Kanal uchun havola qaytaradi.
+    - Ochiq kanal (@username): doim https://t.me/username dan foydalanadi (eskirmaydi)
+    - Yopiq kanal: kanal QO'SHILGANDA bir marta yaratilgan (member_limit va
+      expire_date berilmagan) taklif havolasi qaytariladi. Bunday havolalar
+      Telegram tomonidan o'z-o'zidan eskirmaydi, shuning uchun har bir
+      tekshiruvda YANGI havola yaratishga hojat yo'q — aksincha, doimiy
+      qayta-yaratish urinishlari Telegram tezlik cheklovi (rate limit)ga
+      urilib, tasodifiy xatoliklarga sabab bo'lishi mumkin edi.
+    """
+    if str(ch_id).startswith("@"):
+        username = ch_id.lstrip("@")
+        return f"https://t.me/{username}"
+    return link
 
 def is_super_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
@@ -371,27 +370,20 @@ async def set_premium_price(price: str, days: int = 30):
     await db.commit()
 
 
-# ─── KANAL USERNAME TOZALASH (MAXSUS BELGILAR FIX) ──────────────────────────
+# ─── KANAL USERNAME TOZALASH ─────────────────────────────────────────────────
 
 def clean_tme_path(raw: str) -> str:
     """
     t.me havolasidan yoki username inputidan sof username ajratib oladi.
-    URL-encoded belgilar (%20 va h.k.), ortiqcha /, ? parametrlar,
+    URL-encoded belgilar (%20, %5F va h.k.), ortiqcha /, ? parametrlar,
     bosh-oxirdagi bo'sh joylar barchasini tozalaydi.
-    Misol:
-      https://t.me/my%5Fchannel  →  my_channel
-      @My.Channel                →  My.Channel
-      t.me/channel/              →  channel
     """
     raw = raw.strip()
-    # URL decode (masalan %5F → _)
     raw = unquote(raw)
-    # t.me/ linkdan path ajratamiz
     for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
         if raw.lower().startswith(prefix.lower()):
             raw = raw[len(prefix):]
             break
-    # Query string olib tashlaymiz
     raw = raw.split("?")[0].strip("/").strip()
     return raw
 
@@ -399,14 +391,10 @@ def parse_channel_input(raw: str):
     """
     Admin tomonidan kiritilgan kanal input'ini tahlil qiladi.
     Qaytaradi: (chat_id_for_api, full_link_or_none, is_invite)
-      - chat_id_for_api: bot.get_chat() ga beriladigan argument
-      - full_link_or_none: saqlash uchun to'liq havola (yopiq kanal uchun)
-      - is_invite: True = yopiq kanal invite havolasi
     """
     raw = raw.strip()
     decoded = unquote(raw)
 
-    # t.me havolasimi?
     is_tme = any(decoded.lower().startswith(p) for p in (
         "https://t.me/", "http://t.me/", "t.me/"
     ))
@@ -415,20 +403,16 @@ def parse_channel_input(raw: str):
         path = clean_tme_path(decoded)
         full_link = "https://t.me/" + path
 
-        # Yopiq kanal: t.me/+XYZ yoki t.me/joinchat/XYZ
         if path.startswith("+") or path.lower().startswith("joinchat/"):
             return None, full_link, True
 
-        # Ochiq kanal username
         username = "@" + path.lstrip("@")
         return username, full_link, False
 
-    # Faqat raqam yoki -100... formatidagi ID
     stripped = decoded.lstrip("@").strip()
     if re.match(r'^-?\d+$', stripped):
         return int(stripped), None, False
 
-    # @ bilan yoki @ siz username
     username = "@" + stripped.lstrip("@")
     return username, None, False
 
@@ -436,13 +420,11 @@ def parse_channel_input(raw: str):
 # ─── TUGMALAR ────────────────────────────────────────────────────────────────
 
 def main_menu(user_id: int = 0):
-    """Asosiy menyu."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="📺 Seriallar")],
             [KeyboardButton(text="⛩ Anime va Multfilm")],
             [KeyboardButton(text="🔍 Kod orqali qidirish"), KeyboardButton(text="🌟 Premium")],
-            [KeyboardButton(text="🎁 Referal dasturi")],
         ],
         resize_keyboard=True
     )
@@ -485,7 +467,6 @@ async def check_subscriptions(user_id: int):
         title = ch["title"]
         ch_type = ch["type"]
 
-        # Bot, Instagram, manual — qo'lda tasdiqlash
         if ch_type in ("bot", "instagram", "manual"):
             async with db.execute(
                 "SELECT 1 FROM manual_confirmations WHERE user_id=? AND channel_id=?",
@@ -496,19 +477,38 @@ async def check_subscriptions(user_id: int):
                 unsubscribed.append((ch_id, link, title, ch_type))
             continue
 
-        # Telegram kanal/guruh — API tekshiruvi
+        # Telegram kanal/guruh — API orqali tekshirish
         if str(ch_id).lstrip("-").isdigit():
             chat_id = int(ch_id)
         else:
-            chat_id = ch_id  # @username ko'rinishida saqlangan
+            chat_id = ch_id  # @username ko'rinishida
 
         member = await safe_get_chat_member(chat_id, user_id)
-        if member is None or member.status in ("left", "kicked"):
+        is_subscribed = member is not None and member.status not in ("left", "kicked")
+
+        if not is_subscribed:
+            # Kanalda "Yangi a'zolarni tasdiqlash" yoqilgan bo'lishi mumkin —
+            # bunday holda foydalanuvchi hali rasman a'zo emas (admin
+            # tasdiqlashini kutmoqda), lekin qo'shilish SO'ROVINI yuborgan
+            # bo'lsa, buni yetarli deb hisoblaymiz.
+            async with db.execute(
+                "SELECT 1 FROM manual_confirmations WHERE user_id=? AND channel_id=?",
+                (user_id, ch_id)
+            ) as cur2:
+                requested = await cur2.fetchone()
+            if requested:
+                is_subscribed = True
+
+        if not is_subscribed:
             unsubscribed.append((ch_id, link, title, ch_type))
 
     return unsubscribed
 
 async def build_subscription_keyboard(unsub) -> InlineKeyboardMarkup:
+    """
+    Faqat obuna bo'linmagan kanallar ko'rsatiladi.
+    Faqat "✅ Tekshirish" va "🌟 Premium" tugmalari qoladi — "Bosdim" yo'q.
+    """
     buttons = []
     for ch_id, link, title, ch_type in unsub:
         if ch_type in ("bot", "instagram", "manual"):
@@ -520,6 +520,7 @@ async def build_subscription_keyboard(unsub) -> InlineKeyboardMarkup:
                     text=f"{icon} {title}", callback_data="noop"
                 )])
         else:
+            # Telegram kanal: havola olish (public => username URL, private => yangi invite)
             real_link = await get_channel_link(ch_id, link)
             if real_link:
                 buttons.append([InlineKeyboardButton(text=f"📢 {title}", url=real_link)])
@@ -527,6 +528,7 @@ async def build_subscription_keyboard(unsub) -> InlineKeyboardMarkup:
                 buttons.append([InlineKeyboardButton(
                     text=f"📢 {title}", callback_data="noop"
                 )])
+    # Faqat "Tekshirish" va "Premium" tugmalari
     buttons.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")])
     buttons.append([InlineKeyboardButton(
         text="🌟 Premium tarifga obuna bo'lish", callback_data="req_premium"
@@ -633,57 +635,30 @@ async def start_cmd(message: types.Message):
     user_id = message.from_user.id
     db = await get_db()
 
-    async with db.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)) as cur:
-        is_new_user = (await cur.fetchone()) is None
-
     await db.execute(
         "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?, ?)",
         (user_id, datetime.now().isoformat())
     )
     await db.commit()
 
-    if is_new_user and payload and payload.startswith("ref_"):
-        ref_id_str = payload[4:]
-        if ref_id_str.isdigit() and int(ref_id_str) != user_id:
-            ref_id = int(ref_id_str)
-            async with db.execute(
-                "SELECT 1 FROM users WHERE user_id=?", (ref_id,)
-            ) as cur:
-                ref_exists = await cur.fetchone()
-            if ref_exists:
-                await db.execute(
-                    "UPDATE users SET referred_by=? WHERE user_id=?", (ref_id, user_id)
-                )
-                await db.commit()
-
     is_prem = await is_premium_user(user_id)
 
-    # Deep-link orqali media kodi yuborilgan bo'lsa (masalan t.me/bot?start=1234)
-    if payload and not payload.startswith("ref_") and not is_prem:
-        # Avval obunani tekshiramiz
-        unsub = await check_subscriptions(user_id)
-        if unsub:
-            kb = await build_subscription_keyboard(unsub)
-            await message.answer(
-                "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo'ling:\n\n"
-                "ℹ️ _Premium a'zolarga majburiy kanal obunasi talab qilinmaydi!_",
-                reply_markup=kb, parse_mode="Markdown"
-            )
-            return
-        # Obuna mavjud — mediani yuboramiz
+    if payload:
+        if not is_prem:
+            unsub = await check_subscriptions(user_id)
+            if unsub:
+                kb = await build_subscription_keyboard(unsub)
+                await message.answer(
+                    "⚠️ Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo'ling:\n\n"
+                    "ℹ️ _Premium a'zolarga majburiy kanal obunasi talab qilinmaydi!_",
+                    reply_markup=kb, parse_mode="Markdown"
+                )
+                return
         await message.answer(
             "Xush kelibsiz! Kerakli bo'limni tanlang:",
             reply_markup=main_menu(user_id)
         )
-        await deliver_media_by_code(message, user_id, payload.strip())
-        return
-
-    if payload and not payload.startswith("ref_") and is_prem:
-        await message.answer(
-            "Xush kelibsiz! Kerakli bo'limni tanlang:",
-            reply_markup=main_menu(user_id)
-        )
-        await deliver_media_by_code(message, user_id, payload.strip())
+        await deliver_media_by_code(message, user_id, payload)
         return
 
     if is_prem:
@@ -723,10 +698,10 @@ async def check_sub_cb(call: types.CallbackQuery):
             "✅ Siz Premium a'zosiz! Menyudan foydalanishingiz mumkin:",
             reply_markup=main_menu(user_id)
         )
+        await call.answer()
         return
 
-    # "Bosdim" tugmasi yo'q — "Tekshirish" bosilganda bot/instagram/manual
-    # kanallarni avtomatik tasdiqlaymiz (ularni API orqali tekshirib bo'lmaydi)
+    # bot/instagram/manual kanallar uchun manual tasdiq (API orqali tekshirib bo'lmaydi)
     db = await get_db()
     async with db.execute("SELECT channel_id, type FROM channels") as cur:
         all_channels = await cur.fetchall()
@@ -741,7 +716,7 @@ async def check_sub_cb(call: types.CallbackQuery):
 
     unsub = await check_subscriptions(user_id)
     if unsub:
-        # Faqat qolgan (hali obuna bo'linmagan) kanallarni ko'rsat
+        # Faqat hali obuna bo'linmagan kanallarni ko'rsat
         kb = await build_subscription_keyboard(unsub)
         try:
             await call.message.edit_text(
@@ -798,7 +773,6 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
         )
         return
 
-    # ✅ Faqat adminlar uzata oladi — boshqalar uchun protect_content=True
     user_is_admin = await is_bot_admin(user_id)
 
     for row in results:
@@ -840,7 +814,6 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
                 video=file_id,
                 caption=caption,
                 parse_mode="Markdown",
-                # Admin erkin uzata oladi; boshqalar uzata olmaydi
                 protect_content=not user_is_admin,
                 reply_markup=rating_kb
             )
@@ -994,7 +967,7 @@ async def close_list_cb(call: types.CallbackQuery):
     await call.answer()
 
 
-# ─── REYTINIG OVOZ ───────────────────────────────────────────────────────────
+# ─── REYTING OVOZ ────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("vote_"))
 async def vote_cb(call: types.CallbackQuery):
@@ -1151,10 +1124,6 @@ async def premium_info(message: types.Message):
             callback_data="pay_card"
         )],
         [InlineKeyboardButton(
-            text="💰 Balansdan to'lash",
-            callback_data="pay_balance"
-        )],
-        [InlineKeyboardButton(
             text="👨‍💻 Admin bilan bog'lanish",
             url=f"https://t.me/{ADMIN_USERNAME}"
         )],
@@ -1173,35 +1142,6 @@ async def premium_info(message: types.Message):
     )
 
 
-# ─── REFERAL DASTURI ─────────────────────────────────────────────────────────
-
-@dp.message(F.text == "🎁 Referal dasturi")
-async def referral_info(message: types.Message):
-    user_id = message.from_user.id
-    db = await get_db()
-    async with db.execute(
-        "SELECT balance FROM users WHERE user_id=?", (user_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    balance = (row["balance"] or 0) if row else 0
-
-    async with db.execute(
-        "SELECT COUNT(*) as cnt FROM users WHERE referred_by=?", (user_id,)
-    ) as cur:
-        ref_row = await cur.fetchone()
-    ref_count = ref_row["cnt"] if ref_row else 0
-
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
-
-    await message.answer(
-        f"🎁 *Referal dasturi*\n\n"
-        f"👥 Sizning referal havolangiz:\n`{ref_link}`\n\n"
-        f"👤 Taklif qilgan do'stlaringiz: *{ref_count} ta*\n\n"
-        f"ℹ️ _Havolangizni ulashing va do'stlaringizni taklif qiling!_",
-        parse_mode="Markdown"
-    )
-
-
 # ─── TO'LOV ───────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "req_premium")
@@ -1211,10 +1151,6 @@ async def req_premium_cb(call: types.CallbackQuery):
         [InlineKeyboardButton(
             text=f"💳 Karta orqali to'lash ({price} so'm)",
             callback_data="pay_card"
-        )],
-        [InlineKeyboardButton(
-            text="💰 Balansdan to'lash",
-            callback_data="pay_balance"
         )],
         [InlineKeyboardButton(
             text="👨‍💻 Admin bilan bog'lanish",
@@ -1243,66 +1179,6 @@ async def pay_card_cb(call: types.CallbackQuery, state: FSMContext):
         f"⚠️ *Eslatma:* Chekni tashlamasangiz, Premium berilmaydi!",
         parse_mode="Markdown"
     )
-    await call.answer()
-
-@dp.callback_query(F.data == "pay_balance")
-async def pay_balance_cb(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    price_str = await get_premium_price(30)
-    try:
-        price = int(price_str.replace(",", "").replace(" ", ""))
-    except ValueError:
-        price = 0
-
-    db = await get_db()
-    async with db.execute(
-        "SELECT balance FROM users WHERE user_id=?", (user_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    balance = (row["balance"] or 0) if row else 0
-
-    if balance < price:
-        missing = price - balance
-        await call.message.answer(
-            f"❌ Balansingiz yetarli emas.\n\n"
-            f"💰 Balansingiz: *{balance:,} so'm*\n"
-            f"💰 Kerak: *{price:,} so'm*\n"
-            f"➕ Yetishmayapti: *{missing:,} so'm*\n\n"
-            f"🎁 *Referal dasturi* orqali to'plashingiz yoki "
-            f"💳 karta orqali to'lashingiz mumkin.",
-            parse_mode="Markdown"
-        )
-        await call.answer()
-        return
-
-    new_balance = balance - price
-    await db.execute(
-        "UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id)
-    )
-    await db.commit()
-    expire = await add_premium(user_id, PREMIUM_DAYS)
-    expire_str = expire.strftime("%d.%m.%Y")
-
-    await call.message.answer(
-        f"🎉 *Tabriklaymiz!* Premium balansingizdan avtomatik faollashtirildi!\n\n"
-        f"💰 Yechildi: *{price:,} so'm*\n"
-        f"💰 Qolgan balans: *{new_balance:,} so'm*\n"
-        f"📅 Muddat: *{expire_str}* gacha\n\n"
-        f"🌟 *Premium* tugmasini bosib barcha eksklyuziv kinolarni tomosha qiling!",
-        parse_mode="Markdown"
-    )
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"💰 *Balansdan avtomatik to'lov!*\n\n"
-            f"👤 Foydalanuvchi: `{user_id}`\n"
-            f"💳 Yechilgan summa: *{price:,} so'm*\n"
-            f"💰 Qolgan balans: *{new_balance:,} so'm*\n"
-            f"📅 Muddat: *{expire_str}* gacha",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
     await call.answer()
 
 @dp.message(PaymentReceipt.waiting_for_receipt, F.photo)
@@ -1781,7 +1657,7 @@ async def delete_media_finish(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# ─── KANAL QO'SHISH (MAXSUS BELGILAR TO'G'IRLANGAN) ─────────────────────────
+# ─── KANAL QO'SHISH ──────────────────────────────────────────────────────────
 
 @dp.message(F.text == "📢 Kanal qo'shish", StateFilter("*"))
 async def add_channel_start(message: types.Message, state: FSMContext):
@@ -1812,10 +1688,10 @@ async def add_channel_type_telegram(call: types.CallbackQuery, state: FSMContext
     await call.message.answer(
         "📢 *Telegram kanal yoki guruh qo'shish*\n\n"
         "Quyidagilardan birini yuboring:\n"
-        "• Kanal username'i: `@mening_kanalim`\n"
-        "• Kanal ID raqami: `-1001234567890`\n"
-        "• t.me havolasi: `https://t.me/mening_kanalim`\n"
-        "• Yopiq kanal taklifi: `https://t.me/+AbCdEfGh1234`\n\n"
+        "• Kanal username: @mening\\_kanalim\n"
+        "• Kanal ID raqami: -1001234567890\n"
+        "• t.me havolasi: https://t.me/mening\\_kanalim\n"
+        "• Yopiq kanal taklifi: https://t.me/+AbCdEfGh1234\n\n"
         "ℹ️ _Bot kanalga admin qilib qo'shilgan bo'lishi shart!_\n\n"
         "Bekor qilish: /bekor",
         parse_mode="Markdown",
@@ -1829,24 +1705,36 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
 
     chat_id_for_api, full_link, is_invite = parse_channel_input(raw)
 
-    # ── Yopiq kanal invite havolasi ──────────────────────────────────────────
+    # ── Yopiq kanal invite havolasi ──
     if is_invite:
+        # Faqat havola matnini saqlash YETARLI EMAS: statik taklif havolasi
+        # vaqt o'tishi, foydalanish limiti yoki qayta generatsiya qilinishi
+        # sababli "eskirgan havola" bo'lib qoladi va bot a'zolikni Telegram
+        # API orqali hech qachon tekshira olmaydi. Shuning uchun kanalning
+        # HAQIQIY (raqamli) ID'ini aniqlashimiz kerak — shunda bot: (1) har
+        # safar yangi, eskirmaydigan taklif havolasi yaratadi, (2) a'zolikni
+        # real vaqtda tekshiradi.
         await state.update_data(invite_link=full_link)
-        await state.set_state(AdminChannel.waiting_for_invite_title)
+        await state.set_state(AdminChannel.waiting_for_invite_resolve)
         await message.answer(
-            "🔒 Bu — yopiq kanalning *taklif havolasi*. Bunday havoladan a'zolikni "
-            "avtomatik tekshirib bo'lmaydi, shuning uchun foydalanuvchi o'zi "
-            "\"✅ Bosdim\" tugmasi orqali tasdiqlaydi.\n\n"
-            "1️⃣ Bu kanal uchun nom kiriting (masalan: `Yopiq kanalimiz`):",
+            "🔒 Bu — yopiq kanalning *taklif havolasi*.\n\n"
+            "Yopiq kanallar uchun bot kanalning *haqiqiy ID raqamini* bilishi shart "
+            "— aks holda havola vaqt o'tib \"eskirgan\" bo'lib qoladi va "
+            "a'zolikni tekshira olmaydi.\n\n"
+            "Iltimos quyidagilardan *birini* bajaring:\n"
+            "1️⃣ Botni shu kanalga *administrator* qilib qo'shing, so'ng o'sha "
+            "kanaldan istalgan xabarni shu yerga *forward* (uzatib) yuboring — "
+            "ID avtomatik aniqlanadi.\n"
+            "2️⃣ Yoki kanal ID raqamini qo'lda yuboring (masalan: `-1001234567890`).\n\n"
+            "Bekor qilish: /bekor",
             parse_mode="Markdown"
         )
         return
 
-    # ── Telegram kanal/guruh: API orqali tekshirish ───────────────────────────
+    # ── Telegram kanal/guruh: API orqali tekshirish ──
     chat = await safe_get_chat(chat_id_for_api)
 
     if not chat:
-        # Agar username bilan topilmasa, @ olib qaytadan urinib ko'ramiz
         if isinstance(chat_id_for_api, str) and chat_id_for_api.startswith("@"):
             alt = chat_id_for_api.lstrip("@")
             chat = await safe_get_chat(alt)
@@ -1855,9 +1743,9 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
         await message.answer(
             "❌ Bot bu kanal/guruhni topa olmadi.\n\n"
             "*Tekshiring:*\n"
-            "1️⃣ Username yoki havola to'g'ri yozilganmi?\n"
-            "2️⃣ Bot kanalga admin qilib qo'shilganmi?\n"
-            "3️⃣ Maxsus belgilar (nuqta, tire) bo'lsa, ID raqamini ishlating\n\n"
+            "1. Username yoki havola to'g'ri yozilganmi?\n"
+            "2. Bot kanalga admin qilib qo'shilganmi?\n"
+            "3. Maxsus belgilar bo'lsa, ID raqamini (-100...) ishlating\n\n"
             "Qaytadan yuboring yoki /bekor deb yozing.",
             parse_mode="Markdown"
         )
@@ -1869,65 +1757,122 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
         title = chat.title or str(chat.id)
         uname = f"@{chat.username}" if getattr(chat, "username", None) else None
 
-        await state.update_data(
-            ch_id=str(chat.id),
-            ch_type="telegram",
-            detected_title=title,
-            detected_username=uname
-        )
-        await state.set_state(AdminChannel.waiting_for_link)
-
         type_label = {
             "channel": "📢 Kanal",
             "group": "👥 Guruh",
             "supergroup": "👥 Guruh (supergroup)"
         }.get(ch_type_detected, "Chat")
-        # username da _ belgisi bo'lsa Markdown uni kursivga aylantiradi — escape qilamiz
-        uname_str = md_escape(uname) if uname else "_(username yo'q)_"
 
-        await message.answer(
-            f"✅ *Aniqlandi!*\n\n"
-            f"🏷 Nomi: *{md_escape(title)}*\n"
-            f"📌 Turi: {type_label}\n"
-            f"👤 Username: {uname_str}\n\n"
-            f"Endi qo'shilish havolasini yuboring.\n"
-            f"_(Username bo'lsa `yo'q` deb yozing — havola avtomatik yasaladi)_",
-            parse_mode="Markdown"
-        )
+        uname_safe = md_escape(uname) if uname else "_(username yo'q)_"
+        title_safe = md_escape(title)
 
-        # Bot admin ekanligini tekshirish
+        # Botning admin holati va "havola orqali qo'shish" huquqini tekshiramiz
+        is_admin_here = False
+        can_invite = False
         try:
             me_member = await asyncio.wait_for(
                 bot.get_chat_member(chat.id, (await bot.get_me()).id),
                 timeout=API_TIMEOUT
             )
-            if me_member.status not in ("administrator", "creator"):
-                await message.answer(
-                    "⚠️ *DIQQAT:* Bot bu kanalda hali *administrator* emas!\n"
-                    "Bot admin qilinmaguncha foydalanuvchilar obunasi "
-                    "to'g'ri tekshirilmaydi.",
-                    parse_mode="Markdown"
-                )
+            is_admin_here = me_member.status in ("administrator", "creator")
+            if me_member.status == "creator":
+                can_invite = True
+            else:
+                can_invite = bool(getattr(me_member, "can_invite_users", False))
         except Exception as e:
             logging.warning(f"Bot admin holatini tekshirib bo'lmadi ({chat.id}): {e}")
 
+        if not is_admin_here:
+            await state.clear()
+            await message.answer(
+                f"✅ *Aniqlandi!*\n\n"
+                f"🏷 Nomi: *{title_safe}*\n"
+                f"📌 Turi: {type_label}\n"
+                f"👤 Username: {uname_safe}\n\n"
+                "⚠️ *DIQQAT:* Bot bu kanalda hali *administrator* emas!\n"
+                "Botni admin qilib qo'shing, so'ng \"📢 Kanal qo'shish\" dan "
+                "qaytadan urinib ko'ring.",
+                parse_mode="Markdown",
+                reply_markup=admin_menu(message.from_user.id)
+            )
+            return
+
+        if uname:
+            # Ochiq kanal: o'zgarmas, hech qachon eskirmaydigan t.me/username havolasi
+            link = f"https://t.me/{uname.lstrip('@')}"
+            save_ch_id = uname
+        else:
+            # Yopiq kanal: bot HAR DOIM o'zi taklif havolasi yaratadi.
+            # Qo'lda kiritilgan/nusxalangan havolalarga ISHONILMAYDI, chunki
+            # ular istalgan payt bekor qilinishi yoki eskirishi mumkin va
+            # bot buni kuzatib bora olmaydi — aynan shu "eskirgan havola"
+            # xatosining sababi shu edi.
+            if not can_invite:
+                await state.clear()
+                await message.answer(
+                    f"✅ *Aniqlandi!*\n\n"
+                    f"🏷 Nomi: *{title_safe}*\n"
+                    f"📌 Turi: {type_label}\n\n"
+                    "⛔ Lekin botda *\"Foydalanuvchilarni havola orqali qo'shish\"* "
+                    "huquqi yo'q, shuning uchun ishonchli (eskirmaydigan) havola "
+                    "yarata olmayapman.\n\n"
+                    "🔧 *Tuzatish:* Telegram'da kanal → Administratorlar → botni "
+                    "tanlang → shu huquqni yoqing, so'ng \"📢 Kanal qo'shish\" dan "
+                    "qaytadan urinib ko'ring.",
+                    parse_mode="Markdown",
+                    reply_markup=admin_menu(message.from_user.id)
+                )
+                return
+            try:
+                invite = await asyncio.wait_for(
+                    bot.create_chat_invite_link(chat.id),
+                    timeout=API_TIMEOUT
+                )
+                link = invite.invite_link
+            except Exception as e:
+                logging.error(f"Invite link yaratib bo'lmadi ({chat.id}): {e}")
+                await state.clear()
+                await message.answer(
+                    f"❌ Taklif havolasini yaratib bo'lmadi: `{e}`\n\n"
+                    "\"📢 Kanal qo'shish\" dan qaytadan urinib ko'ring.",
+                    parse_mode="Markdown",
+                    reply_markup=admin_menu(message.from_user.id)
+                )
+                return
+            save_ch_id = str(chat.id)
+
+        db = await get_db()
+        await db.execute(
+            "INSERT OR IGNORE INTO channels (channel_id, title, link, type) "
+            "VALUES (?, ?, ?, 'telegram')",
+            (save_ch_id, title, link)
+        )
+        await db.commit()
+        await state.clear()
+        await message.answer(
+            f"✅ *Kanal/guruh qo'shildi!*\n\n"
+            f"🏷 Nomi: *{title_safe}*\n"
+            f"📌 Turi: {type_label}\n"
+            f"🆔 ID: `{save_ch_id}`\n"
+            f"🔗 Havola: {link}",
+            parse_mode="Markdown",
+            reply_markup=admin_menu(message.from_user.id)
+        )
+
     else:
-        # Bot yoki oddiy foydalanuvchi (Telegram'da ikkalasi ham type='private')
+        # Bot yoki oddiy foydalanuvchi
         uname = getattr(chat, "username", None)
         if not uname and isinstance(chat_id_for_api, str):
             uname = chat_id_for_api.lstrip("@")
 
-        # Telegram qoidasiga ko'ra HAR QANDAY bot username'i "bot" bilan tugaydi
-        # (BotFather shunga majburlaydi). Shu orqali haqiqiy botni oddiy
-        # foydalanuvchidan farqlaymiz.
         is_real_bot = bool(uname) and uname.lower().endswith("bot")
 
         if not is_real_bot:
             await message.answer(
                 "❌ Bu — bot emas, oddiy foydalanuvchi profili ko'rinadi.\n\n"
                 "Majburiy obuna faqat *kanal*, *guruh* yoki *bot* uchun qo'shiladi.\n"
-                "Agar bu chindan ham bot bo'lsa, uning username'i doim "
-                "`...bot` bilan tugashi kerak (masalan: `@mening_kanalim_bot`).\n\n"
+                "Agar bu chindan ham bot bo'lsa, uning username doim "
+                "`...bot` bilan tugashi kerak.\n\n"
                 "Qaytadan yuboring yoki /bekor deb yozing.",
                 parse_mode="Markdown"
             )
@@ -1950,84 +1895,144 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
         )
         await db.commit()
         await state.clear()
+        uname_safe = md_escape(uname) if uname else "yo'q"
+        title_safe = md_escape(title)
+        no_link = "_(yo'q)_"
         await message.answer(
             f"✅ *Telegram bot qo'shildi!*\n\n"
-            f"🤖 Nomi: *{md_escape(title)}*\n"
-            f"👤 Username: @{md_escape(uname)}\n"
-            f"🔗 Havola: {link if link else '_(yo`q)_'}\n\n"
+            f"🤖 Nomi: *{title_safe}*\n"
+            f"👤 Username: @{uname_safe}\n"
+            f"🔗 Havola: {link if link else no_link}\n\n"
             f"ℹ️ Foydalanuvchilar botga o'tib, keyin "
-            f"\"✅ Bosdim\" tugmasini bosib tasdiqlaydi.",
+            f"\"✅ Tekshirish\" tugmasini bosib tasdiqlaydi.",
             parse_mode="Markdown",
             reply_markup=admin_menu(message.from_user.id)
         )
 
-@dp.message(AdminChannel.waiting_for_invite_title)
-async def add_channel_invite_title(message: types.Message, state: FSMContext):
+@dp.message(AdminChannel.waiting_for_invite_resolve)
+async def add_channel_invite_resolve(message: types.Message, state: FSMContext):
     data = await state.get_data()
     invite_link = data.get("invite_link", "")
-    title = message.text.strip()
-    ch_id = f"manual_{int(datetime.now().timestamp())}"
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO channels (channel_id, title, link, type) VALUES (?, ?, ?, 'manual')",
-        (ch_id, title, invite_link)
-    )
-    await db.commit()
-    await state.clear()
-    await message.answer(
-        f"✅ *Yopiq kanal qo'shildi!*\n\n"
-        f"📢 Nomi: *{md_escape(title)}*\n"
-        f"🔗 Taklif havolasi: {invite_link}\n\n"
-        f"ℹ️ Foydalanuvchilar havolani ochib, \"✅ Bosdim\" tugmasini bosib tasdiqlaydi.",
-        parse_mode="Markdown",
-        reply_markup=admin_menu(message.from_user.id)
-    )
 
-@dp.message(AdminChannel.waiting_for_link)
-async def add_channel_finish(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    ch_id = data["ch_id"]
-    detected_username = data.get("detected_username")
-    title = data.get("detected_title", "Kanal")
-    raw_link = message.text.strip()
+    chat_id_int = None
 
-    if raw_link.lower() in ("yo'q", "yoq", "-", "yo`q", "yoʻq", "none"):
-        link = (
-            f"https://t.me/{detected_username.lstrip('@')}"
-            if detected_username else ""
-        )
+    # 1) Kanaldan forward qilingan xabar bo'lsa — undan chat ID olamiz
+    fwd_chat = getattr(message, "forward_from_chat", None)
+    if fwd_chat is not None:
+        chat_id_int = fwd_chat.id
     else:
-        link = raw_link
+        # 2) Yoki admin to'g'ridan-to'g'ri raqamli ID yuborgan bo'lishi mumkin
+        raw = (message.text or "").strip()
+        if re.match(r'^-?\d+$', raw):
+            chat_id_int = int(raw)
 
-    if not link:
+    if chat_id_int is None:
+        await message.answer(
+            "❌ Kanal ID'ini aniqlab bo'lmadi.\n\n"
+            "• Kanaldan xabar *forward* qiling (bot o'sha kanalda admin bo'lishi shart), "
+            "yoki\n"
+            "• Kanal ID raqamini yuboring (masalan: `-1001234567890`).\n\n"
+            "Bekor qilish: /bekor",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ID topilgach — bot haqiqatan ham shu kanalni ko'ra oladimi, tekshiramiz
+    chat = await safe_get_chat(chat_id_int)
+    if not chat:
+        await message.answer(
+            "❌ Bot bu kanalni topa olmadi.\n\n"
+            "Bot kanalga *administrator* qilib qo'shilganini tekshirib, "
+            "qaytadan urinib ko'ring yoki /bekor deb yozing.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Bot shu kanalda admin ekanini VA aniq "havola orqali qo'shish" huquqiga
+    # ega ekanini tekshiramiz — aks holda create_chat_invite_link ishlamaydi
+    is_admin_here = False
+    can_invite = False
+    try:
+        me_member = await asyncio.wait_for(
+            bot.get_chat_member(chat.id, (await bot.get_me()).id),
+            timeout=API_TIMEOUT
+        )
+        is_admin_here = me_member.status in ("administrator", "creator")
+        # Creator uchun bu huquq har doim bor; administrator uchun aniq
+        # can_invite_users maydoni tekshiriladi
+        if me_member.status == "creator":
+            can_invite = True
+        else:
+            can_invite = bool(getattr(me_member, "can_invite_users", False))
+    except Exception as e:
+        logging.warning(f"Bot admin holatini tekshirib bo'lmadi ({chat.id}): {e}")
+
+    if not is_admin_here:
+        await message.answer(
+            "⚠️ Bot bu kanalda hali *administrator* emas.\n\n"
+            "Botni kanalga admin qilib qo'shing (\"Taklif havolalari orqali qo'shish\" "
+            "huquqi bilan), so'ng shu xabarni qaytadan yuboring yoki forward qiling.",
+            parse_mode="Markdown"
+        )
+        return
+
+    title = chat.title or invite_link or str(chat.id)
+    uname = f"@{chat.username}" if getattr(chat, "username", None) else None
+    save_ch_id = uname if uname else str(chat.id)
+
+    # Havolani saqlaymiz: username bo'lsa doim yangilanadigan t.me/username
+    # ishlatiladi; bo'lmasa, bot o'zi YANGI taklif havolasi yaratishi SHART —
+    # aks holda admin qo'lda bergan eski/eskirgan havola saqlanib qolib,
+    # "eskirgan havola" xatosi qaytadan chiqadi.
+    link_to_store = f"https://t.me/{uname.lstrip('@')}" if uname else None
+
+    if not uname:
+        if not can_invite:
+            await message.answer(
+                "⛔ Bot kanalda admin, lekin unda *\"Foydalanuvchilarni havola orqali "
+                "qo'shish\" (Invite Users via Link)* huquqi yo'q.\n\n"
+                "Shu sabab bot o'zi yangi, eskirmaydigan taklif havolasini yarata olmayapti "
+                "— sizning qo'lda bergan eski havolangiz esa allaqachon eskirgan bo'lishi mumkin.\n\n"
+                "🔧 *Tuzatish:* Telegram'da kanal → Administratorlar → botni tanlang → "
+                "\"Foydalanuvchilarni havola orqali qo'shish\" huquqini yoqing, "
+                "so'ng shu xabarni qaytadan yuboring yoki forward qiling.",
+                parse_mode="Markdown"
+            )
+            return
         try:
             invite = await asyncio.wait_for(
-                bot.create_chat_invite_link(int(ch_id)),
+                bot.create_chat_invite_link(chat.id),
                 timeout=API_TIMEOUT
             )
-            link = invite.invite_link
+            link_to_store = invite.invite_link
         except Exception as e:
-            logging.error(f"Invite link yaratib bo'lmadi ({ch_id}): {e}")
+            logging.error(f"Invite link yaratib bo'lmadi ({chat.id}): {e}")
             await message.answer(
-                "⚠️ Bot avtomatik qo'shilish havolasini yarata olmadi.\n"
-                "Iltimos, kanaldan *qo'lda* invite link olib yuboring\n"
-                "(masalan `https://t.me/+abcXYZ`).",
+                f"❌ Bot avtomatik taklif havolasini yarata olmadi: `{e}`\n\n"
+                "Iltimos, botning admin huquqlarini tekshirib, qaytadan urinib ko'ring "
+                "yoki /bekor deb yozing.",
                 parse_mode="Markdown"
             )
             return
 
     db = await get_db()
     await db.execute(
-        "INSERT INTO channels (channel_id, title, link, type) VALUES (?, ?, ?, 'telegram')",
-        (ch_id, title, link)
+        "INSERT OR IGNORE INTO channels (channel_id, title, link, type) "
+        "VALUES (?, ?, ?, 'telegram')",
+        (save_ch_id, title, link_to_store)
     )
     await db.commit()
     await state.clear()
+    title_safe = md_escape(title)
     await message.answer(
-        f"✅ *Kanal/guruh qo'shildi!*\n\n"
-        f"📢 Nomi: *{md_escape(title)}*\n"
-        f"🆔 ID: `{ch_id}`\n"
-        f"🔗 Havola: {link}",
+        f"✅ *Yopiq kanal qo'shildi!*\n\n"
+        f"📢 Nomi: *{title_safe}*\n"
+        f"🆔 ID: `{save_ch_id}`\n"
+        f"🔗 Havola: {link_to_store}\n\n"
+        f"ℹ️ Endi bot foydalanuvchi a'zoligini Telegram API orqali *real vaqtda* "
+        f"tekshiradi va kerak bo'lganda har safar *yangi* taklif havolasi yaratadi — "
+        f"\"eskirgan havola\" xatosi endi chiqmaydi.",
+        parse_mode="Markdown",
         reply_markup=admin_menu(message.from_user.id)
     )
 
@@ -2037,8 +2042,8 @@ async def add_channel_type_instagram(call: types.CallbackQuery, state: FSMContex
     await state.set_state(AdminChannel.waiting_for_manual_title)
     await call.message.answer(
         "📸 *Instagram yoki boshqa tashqi havola qo'shish*\n\n"
-        "1️⃣ Bu havola uchun nom kiriting:\n"
-        "Masalan: `Instagram sahifamiz` yoki `TikTok kanalimiz`",
+        "1. Bu havola uchun nom kiriting:\n"
+        "Masalan: Instagram sahifamiz yoki TikTok kanalimiz",
         parse_mode="Markdown"
     )
     await call.answer()
@@ -2048,10 +2053,10 @@ async def add_channel_manual_title(message: types.Message, state: FSMContext):
     await state.update_data(manual_title=message.text.strip())
     await state.set_state(AdminChannel.waiting_for_manual_link)
     await message.answer(
-        "2️⃣ Havolani (link) yuboring:\n"
-        "Masalan: `https://instagram.com/mening_sahifam`\n\n"
+        "2. Havolani (link) yuboring:\n"
+        "Masalan: https://instagram.com/mening\\_sahifam\n\n"
         "ℹ️ *Eslatma:* Instagram havolalarga a'zolikni Telegram orqali tekshirib bo'lmaydi.\n"
-        "Foydalanuvchi havolani ochib, keyin \"✅ Bosdim\" tugmasini bosadi.",
+        "Foydalanuvchi havolani ochib, keyin \"✅ Tekshirish\" tugmasini bosadi.",
         parse_mode="Markdown"
     )
 
@@ -2064,7 +2069,7 @@ async def add_channel_manual_finish(message: types.Message, state: FSMContext):
 
     if not (link.startswith("http://") or link.startswith("https://")):
         await message.answer(
-            "❌ Iltimos to'liq havola yuboring:\nMasalan: `https://instagram.com/...`",
+            "❌ Iltimos to'liq havola yuboring:\nMasalan: https://instagram.com/...",
             parse_mode="Markdown"
         )
         return
@@ -2078,11 +2083,12 @@ async def add_channel_manual_finish(message: types.Message, state: FSMContext):
     await db.commit()
     icon = "📸" if ch_type == "instagram" else "🔗"
     await state.clear()
+    title_safe = md_escape(title)
     await message.answer(
         f"✅ *Havola qo'shildi!*\n\n"
-        f"{icon} Nomi: *{md_escape(title)}*\n"
+        f"{icon} Nomi: *{title_safe}*\n"
         f"🔗 {link}\n\n"
-        f"ℹ️ Foydalanuvchilar havolani ochib, \"✅ Bosdim\" tugmasini bosib tasdiqlaydi.",
+        f"ℹ️ Foydalanuvchilar havolani ochib, \"✅ Tekshirish\" tugmasini bosib tasdiqlaydi.",
         parse_mode="Markdown",
         reply_markup=admin_menu(message.from_user.id)
     )
@@ -2156,16 +2162,64 @@ async def list_channels(message: types.Message, state: FSMContext):
 
     type_icons = {"telegram": "📢", "bot": "🤖", "instagram": "📸", "manual": "🔗"}
     text = "📋 *Kanallar ro'yxati:*\n\n"
+    refresh_buttons = []
     for ch in channels:
         icon = type_icons.get(ch["type"], "🔗")
-        link_str = ch["link"] or "_(havola yo'q)_"
+        link_str = ch["link"] if ch["link"] else "_(havola yo'q)_"
         ch_id_str = md_escape(str(ch["channel_id"]))
+        title_str = md_escape(ch["title"])
         text += (
-            f"{icon} *{md_escape(ch['title'])}*\n"
+            f"{icon} *{title_str}*\n"
             f"  🆔 `{ch_id_str}`\n"
             f"  🔗 {link_str}\n\n"
         )
-    await message.answer(text, parse_mode="Markdown")
+        # Faqat yopiq (raqamli ID) Telegram kanallar uchun havolani
+        # yangilash imkoniyati beramiz — @username kanallarga kerak emas
+        if ch["type"] == "telegram" and not str(ch["channel_id"]).startswith("@"):
+            short_title = ch["title"][:28]
+            refresh_buttons.append([InlineKeyboardButton(
+                text=f"🔄 {short_title}",
+                callback_data=f"refresh_link_{ch['channel_id']}"
+            )])
+
+    kb = None
+    if refresh_buttons:
+        text += "ℹ️ _Yopiq kanal havolasi ishlamay qolsa, quyidan yangilang:_"
+        kb = InlineKeyboardMarkup(inline_keyboard=refresh_buttons)
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("refresh_link_"))
+async def refresh_channel_link_cb(call: types.CallbackQuery):
+    if not await is_bot_admin(call.from_user.id):
+        await call.answer("⛔ Ruxsat yo'q.", show_alert=True)
+        return
+    ch_id = call.data[len("refresh_link_"):]
+    try:
+        chat_id_int = int(ch_id)
+    except ValueError:
+        await call.answer("❌ Noto'g'ri kanal ID.", show_alert=True)
+        return
+
+    try:
+        invite = await asyncio.wait_for(
+            bot.create_chat_invite_link(chat_id_int),
+            timeout=API_TIMEOUT
+        )
+        new_link = invite.invite_link
+    except Exception as e:
+        logging.error(f"Havolani yangilashda xato ({ch_id}): {e}")
+        await call.answer(
+            "❌ Yangi havola yaratib bo'lmadi. Botga kanalda \"Foydalanuvchilarni "
+            "havola orqali qo'shish\" huquqi berilganini tekshiring.",
+            show_alert=True
+        )
+        return
+
+    db = await get_db()
+    await db.execute("UPDATE channels SET link=? WHERE channel_id=?", (new_link, ch_id))
+    await db.commit()
+    await call.answer("✅ Yangi havola yaratildi!", show_alert=True)
+    await call.message.answer(f"🔗 Yangi havola:\n{new_link}")
 
 
 # ─── NARX O'ZGARTIRISH ───────────────────────────────────────────────────────
@@ -2348,6 +2402,70 @@ async def process_remove_admin(call: types.CallbackQuery):
         pass
 
 
+# ─── MAXFIY KANAL: A'ZOLIKKA SO'ROV (JOIN REQUEST) ───────────────────────────
+
+async def resolve_tracked_channel_id(chat_id: int, username: str = None):
+    """
+    Berilgan chat botning `channels` bazasida (type='telegram') qanday
+    channel_id bilan saqlanganini topadi (raqamli ID yoki @username
+    ko'rinishida) va shuni qaytaradi. Topilmasa None qaytaradi — bu holda
+    kanal botga aloqasi yo'q, aralashmaymiz.
+    """
+    db = await get_db()
+    async with db.execute(
+        "SELECT channel_id FROM channels WHERE type='telegram'"
+    ) as cur:
+        rows = await cur.fetchall()
+    ids = {row["channel_id"] for row in rows}
+    if str(chat_id) in ids:
+        return str(chat_id)
+    if username and f"@{username}" in ids:
+        return f"@{username}"
+    return None
+
+@dp.chat_join_request()
+async def handle_join_request(join_request: types.ChatJoinRequest):
+    """
+    Kanalda "Yangi a'zolarni tasdiqlash" (Approve New Members) yoqilgan
+    bo'lsa, taklif havolasini bosgan foydalanuvchi darhol a'zo bo'lmaydi —
+    Telegram "qo'shilish so'rovi" yaratadi va kanal administratori buni
+    QO'LDA tasdiqlaydi (bot AVTOMATIK tasdiqlamaydi).
+
+    Lekin botdan foydalanish uchun buni kutish shart emas: foydalanuvchi
+    so'rov YUBORGANI botga yetarli dalil sifatida hisoblanadi va
+    check_subscriptions uni "obuna bo'lgan" deb qabul qiladi.
+    """
+    chat = join_request.chat
+    user = join_request.from_user
+
+    ch_id = await resolve_tracked_channel_id(chat.id, getattr(chat, "username", None))
+    if not ch_id:
+        return  # Botga aloqasi bo'lmagan kanal — aralashmaymiz
+
+    db = await get_db()
+    await db.execute(
+        "INSERT OR REPLACE INTO manual_confirmations (user_id, channel_id, confirmed_at) "
+        "VALUES (?, ?, ?)",
+        (user.id, ch_id, datetime.now().isoformat())
+    )
+    await db.commit()
+    logging.info(f"Join so'rovi qayd etildi (avtomatik tasdiqlanmadi): chat={chat.id} user={user.id}")
+
+    # Foydalanuvchiga botdan qisqa xabar (ixtiyoriy, botni bloklagan bo'lsa xato bermaydi)
+    try:
+        await bot.send_message(
+            user.id,
+            f"✅ *{md_escape(chat.title or 'Kanal')}* ga qo'shilish so'rovingiz qabul qilindi!\n\n"
+            f"Administrator tez orada tasdiqlaydi. Hozircha botdan foydalanishingiz mumkin — "
+            f"\"✅ Tekshirish\" tugmasini bosing.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+    except Exception:
+        pass
+
+
 # ─── COMMANDS ────────────────────────────────────────────────────────────────
 
 @dp.message(Command("kino"))
@@ -2385,12 +2503,10 @@ async def cmd_premium(message: types.Message):
 @dp.message(StateFilter(None))
 async def unknown_message(message: types.Message):
     """
-    Hech qaysi handlerga tushmaydigan har qanday xabarga darhol javob beradi.
-    Foydalanuvchi biror matn yoki fayl yuborganda bot sukunatda qolmaydi.
+    Hech qaysi handlerga tushmaydigan xabarlarga darhol javob beradi.
     """
     user_id = message.from_user.id
 
-    # Admin bo'lsa — admin menyusini ko'rsat
     if await is_bot_admin(user_id):
         await message.answer(
             "ℹ️ Noma'lum buyruq. Menyudan foydalaning:",
@@ -2398,7 +2514,6 @@ async def unknown_message(message: types.Message):
         )
         return
 
-    # Obunasiz foydalanuvchi
     if not await is_premium_user(user_id):
         unsub = await check_subscriptions(user_id)
         if unsub:
@@ -2409,7 +2524,6 @@ async def unknown_message(message: types.Message):
             )
             return
 
-    # Oddiy foydalanuvchi — asosiy menyuni ko'rsat
     await message.answer(
         "ℹ️ Noma'lum buyruq. Quyidagi menyudan foydalaning:",
         reply_markup=main_menu(user_id)
@@ -2432,10 +2546,13 @@ async def set_commands():
         types.BotCommand(command="bekor",  description="❌ Amalni bekor qilish"),
     ]
     await bot.set_my_commands(user_commands)
-    await bot.set_my_commands(
-        admin_commands,
-        scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
-    )
+    try:
+        await bot.set_my_commands(
+            admin_commands,
+            scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
+        )
+    except Exception as e:
+        logging.warning(f"Admin buyruqlari o'rnatilmadi: {e}")
 
 async def run_bot():
     global BOT_USERNAME
@@ -2469,11 +2586,10 @@ async def run_bot():
             await dp.start_polling(
                 bot,
                 allowed_updates=dp.resolve_used_update_types(),
-                # Birinchi ishga tushganda eski (kutib qolgan) xabarlarni o'tkazib yuboramiz
                 drop_pending_updates=first_start,
             )
         except Exception as e:
-            logging.error(f"Polling to'xtadi: {e}. 5 soniyadan keyin qayta urinaladi...")
+            logging.error(f"Polling to'xtadi: {e}. 5 soniyadan keyin qayta uriniladi...")
             await asyncio.sleep(5)
         finally:
             first_start = False
