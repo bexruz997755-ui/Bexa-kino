@@ -22,7 +22,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "8632701533:AAH3vUXRnayCVrUmfvQNsWJJu07krsI8EG8"
+BOT_TOKEN = "3:AAH3vUXRnayCVrUmfvQNsWJJu07krsI8EG8"
 ADMIN_ID =  7825563654
 ADMIN_USERNAME = "Bexr7zz"
 PREMIUM_DAYS = 30
