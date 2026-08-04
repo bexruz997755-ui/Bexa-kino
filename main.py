@@ -22,9 +22,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "8632701533:AAEmKI2F4uyoB7-q5ga-Yc5EHnGjCCAlpeE"
-ADMIN_ID = 7825563654
-ADMIN_USERNAME = "Bexr7zz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -1866,10 +1866,27 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
             logging.warning(f"Bot admin holatini tekshirib bo'lmadi ({chat.id}): {e}")
 
     else:
-        # Bot yoki boshqa chat turi
+        # Bot yoki oddiy foydalanuvchi (Telegram'da ikkalasi ham type='private')
         uname = getattr(chat, "username", None)
         if not uname and isinstance(chat_id_for_api, str):
             uname = chat_id_for_api.lstrip("@")
+
+        # Telegram qoidasiga ko'ra HAR QANDAY bot username'i "bot" bilan tugaydi
+        # (BotFather shunga majburlaydi). Shu orqali haqiqiy botni oddiy
+        # foydalanuvchidan farqlaymiz.
+        is_real_bot = bool(uname) and uname.lower().endswith("bot")
+
+        if not is_real_bot:
+            await message.answer(
+                "❌ Bu — bot emas, oddiy foydalanuvchi profili ko'rinadi.\n\n"
+                "Majburiy obuna faqat *kanal*, *guruh* yoki *bot* uchun qo'shiladi.\n"
+                "Agar bu chindan ham bot bo'lsa, uning username'i doim "
+                "`...bot` bilan tugashi kerak (masalan: `@mening_kanalim_bot`).\n\n"
+                "Qaytadan yuboring yoki /bekor deb yozing.",
+                parse_mode="Markdown"
+            )
+            return
+
         title = (
             getattr(chat, "full_name", None)
             or getattr(chat, "first_name", None)
@@ -1890,6 +1907,7 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
         await message.answer(
             f"✅ *Telegram bot qo'shildi!*\n\n"
             f"🤖 Nomi: *{md_escape(title)}*\n"
+            f"👤 Username: @{uname}\n"
             f"🔗 Havola: {link if link else '_(yo`q)_'}\n\n"
             f"ℹ️ Foydalanuvchilar botga o'tib, keyin "
             f"\"✅ Bosdim\" tugmasini bosib tasdiqlaydi.",
