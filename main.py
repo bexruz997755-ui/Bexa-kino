@@ -22,9 +22,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "3:AAH3vUXRnayCVrUmfvQNsWJJu07krsI8EG8"
-ADMIN_ID =  7825563654
-ADMIN_USERNAME = "Bexr7zz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -150,6 +150,32 @@ async def init_db():
     except Exception:
         pass
 
+    # ── DUBLIKAT KANAL YOZUVLARINI TOZALASH ──
+    # `channels` jadvalida ilgari channel_id ustida UNIQUE cheklov yo'q edi,
+    # shu sababli bir xil kanal bir necha marta qo'shilsa (masalan, avval
+    # eskirgan havola bilan, keyin tuzatilgandan keyin yana), ESKI qator
+    # o'chmasdan, bazada bir nechta yozuv qolib ketardi — va foydalanuvchiga
+    # ba'zan aynan o'sha ESKI (eskirgan) havola ko'rsatilib turardi. Bu yerda
+    # har bir channel_id bo'yicha faqat ENG OXIRGI (eng yangi, id'i eng
+    # katta) qatorni qoldirib, qolganlarini butunlay o'chiramiz, so'ng shu
+    # ustunga UNIQUE indeks qo'yamiz — shunda kelajakda dublikat umuman
+    # yaratilmaydi.
+    try:
+        await _db.execute("""
+            DELETE FROM channels
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM channels GROUP BY channel_id
+            )
+        """)
+        await _db.commit()
+        await _db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_channel_id "
+            "ON channels(channel_id)"
+        )
+        await _db.commit()
+    except Exception as e:
+        logging.warning(f"channels jadvalini tozalab bo'lmadi: {e}")
+
 
 # ─── FSM HOLATLARI ───────────────────────────────────────────────────────────
 
@@ -172,6 +198,7 @@ class AdminChannel(StatesGroup):
     waiting_for_manual_link = State()
     waiting_for_invite_title = State()
     waiting_for_invite_resolve = State()
+    waiting_for_backup_link = State()
 
 class AdminDeleteMedia(StatesGroup):
     waiting_for_code = State()
@@ -1659,6 +1686,150 @@ async def delete_media_finish(message: types.Message, state: FSMContext):
 
 # ─── KANAL QO'SHISH ──────────────────────────────────────────────────────────
 
+async def save_telegram_channel(
+    message: types.Message, state: FSMContext,
+    save_ch_id: str, title: str, link: str, type_label: str
+):
+    """Kanal/guruhni bazaga saqlaydi (yoki eskisini yangilaydi) va adminга
+    yakuniy xabar yuboradi. Agar bu channel_id bazada allaqachon bo'lsa —
+    endi YANGI ma'lumot (jumladan yangi havola) bilan ustidan yoziladi,
+    eski (eskirgan) qator saqlanib qolmaydi."""
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO channels (channel_id, title, link, type) "
+        "VALUES (?, ?, ?, 'telegram') "
+        "ON CONFLICT(channel_id) DO UPDATE SET "
+        "title=excluded.title, link=excluded.link, type=excluded.type",
+        (save_ch_id, title, link)
+    )
+    await db.commit()
+    await state.clear()
+    title_safe = md_escape(title)
+    await message.answer(
+        f"✅ *Kanal/guruh qo'shildi!*\n\n"
+        f"🏷 Nomi: *{title_safe}*\n"
+        f"📌 Turi: {type_label}\n"
+        f"🆔 ID: `{save_ch_id}`\n"
+        f"🔗 Havola: {link}\n\n"
+        f"ℹ️ Yopiq kanal bo'lsa: bot qo'shilish so'rovlarini *avtomatik "
+        f"tasdiqlamaydi* — admin qo'lda tasdiqlaydi. Lekin foydalanuvchi "
+        f"so'rov yuborgani bilanoq botdan foydalanish uchun yetarli deb "
+        f"hisoblanadi (\"✅ Tekshirish\" tugmasi ishlaydi).",
+        parse_mode="Markdown",
+        reply_markup=admin_menu(message.from_user.id)
+    )
+
+
+async def ask_backup_link(
+    message: types.Message, state: FSMContext,
+    chat_id_int: int, can_invite: bool, title: str, type_label: str
+):
+    """
+    Yopiq kanal uchun adminDAN taklif havolasini so'raydi. Bot o'zi
+    avtomatik havola yaratishga urinadi, lekin bunga ishonib qolmaymiz —
+    admin qo'lda bergan (haqiqiy, joriy) havola bo'lsa, aynan shu ishlatiladi.
+    Shu tufayl "havola eskirgan" muammosi bartaraf etiladi: agar botning
+    huquqi yetarli bo'lmasa yoki avtomatik havola biror sababdan ishlamasa,
+    adminning qo'lda bergan joriy havolasi zaxira sifatida saqlanadi.
+    """
+    await state.update_data(
+        pending_chat_id=chat_id_int,
+        pending_title=title,
+        pending_type_label=type_label,
+        pending_can_invite=can_invite,
+    )
+    await state.set_state(AdminChannel.waiting_for_backup_link)
+
+    if can_invite:
+        hint = (
+            "Bot o'zi ham avtomatik, eskirmaydigan taklif havolasi yarata oladi — "
+            "agar shunday bo'lishini istasangiz, /avto deb yozing."
+        )
+    else:
+        hint = (
+            "⚠️ *Diqqat:* botda hozircha \"Foydalanuvchilarni havola orqali "
+            "qo'shish\" huquqi yo'q — shu sabab bot o'zi avtomatik havola "
+            "yarata OLMAYDI. Havolani albatta qo'lda yuboring."
+        )
+
+    await message.answer(
+        f"🔗 *{md_escape(title)}* — yopiq kanal uchun taklif havolasini yuboring.\n\n"
+        "Buni Telegram'da: Kanal → Havolalar (Invite Links) bo'limidan olishingiz "
+        "mumkin, yoki botni admin qilib qo'shganingizda ko'rsatilgan havolani "
+        "yuboring.\n\n"
+        f"{hint}\n\n"
+        "Bekor qilish: /bekor",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(AdminChannel.waiting_for_backup_link)
+async def add_channel_backup_link(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    chat_id_int = data.get("pending_chat_id")
+    title = data.get("pending_title") or ""
+    type_label = data.get("pending_type_label") or "📢 Kanal"
+    can_invite = bool(data.get("pending_can_invite"))
+
+    if chat_id_int is None:
+        await state.clear()
+        await message.answer(
+            "❌ Xatolik yuz berdi, qaytadan boshlang: \"📢 Kanal qo'shish\".",
+            reply_markup=admin_menu(message.from_user.id)
+        )
+        return
+
+    raw = (message.text or "").strip()
+    use_auto = raw.lower() in ("/avto", "avto", "/auto")
+
+    link = None
+    if not use_auto:
+        decoded = unquote(raw)
+        is_tme = any(
+            decoded.lower().startswith(p)
+            for p in ("https://t.me/", "http://t.me/", "t.me/")
+        )
+        if not is_tme:
+            extra = ", yoki /avto deb yozing." if can_invite else "."
+            await message.answer(
+                "❌ Bu to'g'ri taklif havolasiga o'xshamaydi.\n\n"
+                f"`https://t.me/+...` ko'rinishidagi havola yuboring{extra}\n\n"
+                "Bekor qilish: /bekor",
+                parse_mode="Markdown"
+            )
+            return
+        path = clean_tme_path(decoded)
+        link = "https://t.me/" + path
+
+    if link is None:
+        if not can_invite:
+            await message.answer(
+                "⛔ Botda taklif havolasi yaratish huquqi yo'q va siz ham "
+                "havola yubormadingiz.\n\nIltimos havolani qo'lda yuboring "
+                "yoki /bekor deb yozing.",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            invite = await asyncio.wait_for(
+                bot.create_chat_invite_link(chat_id_int),
+                timeout=API_TIMEOUT
+            )
+            link = invite.invite_link
+        except Exception as e:
+            logging.error(f"Invite link yaratib bo'lmadi ({chat_id_int}): {e}")
+            await message.answer(
+                f"❌ Avtomatik havola yaratib bo'lmadi: `{e}`\n\n"
+                "Iltimos havolani qo'lda yuboring yoki /bekor deb yozing.",
+                parse_mode="Markdown"
+            )
+            return
+
+    await save_telegram_channel(
+        message, state, str(chat_id_int), title, link, type_label
+    )
+
+
 @dp.message(F.text == "📢 Kanal qo'shish", StateFilter("*"))
 async def add_channel_start(message: types.Message, state: FSMContext):
     if not await is_bot_admin(message.from_user.id):
@@ -1693,6 +1864,11 @@ async def add_channel_type_telegram(call: types.CallbackQuery, state: FSMContext
         "• t.me havolasi: https://t.me/mening\\_kanalim\n"
         "• Yopiq kanal taklifi: https://t.me/+AbCdEfGh1234\n\n"
         "ℹ️ _Bot kanalga admin qilib qo'shilgan bo'lishi shart!_\n\n"
+        "⚠️ *Yopiq (maxfiy) kanal bo'lsa:* botga \"Foydalanuvchilarni havola "
+        "orqali qo'shish\" (Invite Users via Link) huquqini bering — aks "
+        "holda bot foydalanuvchilarning \"qo'shilish so'rovi\"larini qabul "
+        "qila olmaydi. Keyingi qadamda bot sizdan kanal havolasini ham "
+        "so'raydi.\n\n"
         "Bekor qilish: /bekor",
         parse_mode="Markdown",
         reply_markup=types.ReplyKeyboardRemove()
@@ -1801,63 +1977,17 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
             # Ochiq kanal: o'zgarmas, hech qachon eskirmaydigan t.me/username havolasi
             link = f"https://t.me/{uname.lstrip('@')}"
             save_ch_id = uname
-        else:
-            # Yopiq kanal: bot HAR DOIM o'zi taklif havolasi yaratadi.
-            # Qo'lda kiritilgan/nusxalangan havolalarga ISHONILMAYDI, chunki
-            # ular istalgan payt bekor qilinishi yoki eskirishi mumkin va
-            # bot buni kuzatib bora olmaydi — aynan shu "eskirgan havola"
-            # xatosining sababi shu edi.
-            if not can_invite:
-                await state.clear()
-                await message.answer(
-                    f"✅ *Aniqlandi!*\n\n"
-                    f"🏷 Nomi: *{title_safe}*\n"
-                    f"📌 Turi: {type_label}\n\n"
-                    "⛔ Lekin botda *\"Foydalanuvchilarni havola orqali qo'shish\"* "
-                    "huquqi yo'q, shuning uchun ishonchli (eskirmaydigan) havola "
-                    "yarata olmayapman.\n\n"
-                    "🔧 *Tuzatish:* Telegram'da kanal → Administratorlar → botni "
-                    "tanlang → shu huquqni yoqing, so'ng \"📢 Kanal qo'shish\" dan "
-                    "qaytadan urinib ko'ring.",
-                    parse_mode="Markdown",
-                    reply_markup=admin_menu(message.from_user.id)
-                )
-                return
-            try:
-                invite = await asyncio.wait_for(
-                    bot.create_chat_invite_link(chat.id),
-                    timeout=API_TIMEOUT
-                )
-                link = invite.invite_link
-            except Exception as e:
-                logging.error(f"Invite link yaratib bo'lmadi ({chat.id}): {e}")
-                await state.clear()
-                await message.answer(
-                    f"❌ Taklif havolasini yaratib bo'lmadi: `{e}`\n\n"
-                    "\"📢 Kanal qo'shish\" dan qaytadan urinib ko'ring.",
-                    parse_mode="Markdown",
-                    reply_markup=admin_menu(message.from_user.id)
-                )
-                return
-            save_ch_id = str(chat.id)
+            await save_telegram_channel(message, state, save_ch_id, title, link, type_label)
+            return
 
-        db = await get_db()
-        await db.execute(
-            "INSERT OR IGNORE INTO channels (channel_id, title, link, type) "
-            "VALUES (?, ?, ?, 'telegram')",
-            (save_ch_id, title, link)
-        )
-        await db.commit()
-        await state.clear()
-        await message.answer(
-            f"✅ *Kanal/guruh qo'shildi!*\n\n"
-            f"🏷 Nomi: *{title_safe}*\n"
-            f"📌 Turi: {type_label}\n"
-            f"🆔 ID: `{save_ch_id}`\n"
-            f"🔗 Havola: {link}",
-            parse_mode="Markdown",
-            reply_markup=admin_menu(message.from_user.id)
-        )
+        # Yopiq kanal (username yo'q): ID to'g'ridan-to'g'ri yuborilgan bo'lsa
+        # ham, endi bot HAVOLANI ADMINDAN HAM SO'RAYDI — faqat o'zining
+        # avtomatik yaratgan havolasiga ishonib qolmaydi. Shu tufayl
+        # "havola eskirgan" muammosi oldini oladi: agar botning huquqi
+        # yetarli bo'lmasa yoki avtomatik yaratish muvaffaqiyatsiz bo'lsa,
+        # adminning o'zi bergan joriy (eskirmagan) havola ishlatiladi.
+        await ask_backup_link(message, state, chat.id, can_invite, title, type_label)
+        return
 
     else:
         # Bot yoki oddiy foydalanuvchi
@@ -1889,8 +2019,10 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
 
         db = await get_db()
         await db.execute(
-            "INSERT OR IGNORE INTO channels (channel_id, title, link, type) "
-            "VALUES (?, ?, ?, 'bot')",
+            "INSERT INTO channels (channel_id, title, link, type) "
+            "VALUES (?, ?, ?, 'bot') "
+            "ON CONFLICT(channel_id) DO UPDATE SET "
+            "title=excluded.title, link=excluded.link, type=excluded.type",
             (ch_id, title, link)
         )
         await db.commit()
@@ -1978,63 +2110,21 @@ async def add_channel_invite_resolve(message: types.Message, state: FSMContext):
 
     title = chat.title or invite_link or str(chat.id)
     uname = f"@{chat.username}" if getattr(chat, "username", None) else None
-    save_ch_id = uname if uname else str(chat.id)
 
-    # Havolani saqlaymiz: username bo'lsa doim yangilanadigan t.me/username
-    # ishlatiladi; bo'lmasa, bot o'zi YANGI taklif havolasi yaratishi SHART —
-    # aks holda admin qo'lda bergan eski/eskirgan havola saqlanib qolib,
-    # "eskirgan havola" xatosi qaytadan chiqadi.
-    link_to_store = f"https://t.me/{uname.lstrip('@')}" if uname else None
+    if uname:
+        # Ochiq kanal (username bor): doim yangilanadigan, eskirmaydigan
+        # t.me/username havolasi ishlatiladi — havola so'rashga hojat yo'q.
+        save_ch_id = uname
+        link_to_store = f"https://t.me/{uname.lstrip('@')}"
+        await save_telegram_channel(
+            message, state, save_ch_id, title, link_to_store, "📢 Yopiq kanal"
+        )
+        return
 
-    if not uname:
-        if not can_invite:
-            await message.answer(
-                "⛔ Bot kanalda admin, lekin unda *\"Foydalanuvchilarni havola orqali "
-                "qo'shish\" (Invite Users via Link)* huquqi yo'q.\n\n"
-                "Shu sabab bot o'zi yangi, eskirmaydigan taklif havolasini yarata olmayapti "
-                "— sizning qo'lda bergan eski havolangiz esa allaqachon eskirgan bo'lishi mumkin.\n\n"
-                "🔧 *Tuzatish:* Telegram'da kanal → Administratorlar → botni tanlang → "
-                "\"Foydalanuvchilarni havola orqali qo'shish\" huquqini yoqing, "
-                "so'ng shu xabarni qaytadan yuboring yoki forward qiling.",
-                parse_mode="Markdown"
-            )
-            return
-        try:
-            invite = await asyncio.wait_for(
-                bot.create_chat_invite_link(chat.id),
-                timeout=API_TIMEOUT
-            )
-            link_to_store = invite.invite_link
-        except Exception as e:
-            logging.error(f"Invite link yaratib bo'lmadi ({chat.id}): {e}")
-            await message.answer(
-                f"❌ Bot avtomatik taklif havolasini yarata olmadi: `{e}`\n\n"
-                "Iltimos, botning admin huquqlarini tekshirib, qaytadan urinib ko'ring "
-                "yoki /bekor deb yozing.",
-                parse_mode="Markdown"
-            )
-            return
-
-    db = await get_db()
-    await db.execute(
-        "INSERT OR IGNORE INTO channels (channel_id, title, link, type) "
-        "VALUES (?, ?, ?, 'telegram')",
-        (save_ch_id, title, link_to_store)
-    )
-    await db.commit()
-    await state.clear()
-    title_safe = md_escape(title)
-    await message.answer(
-        f"✅ *Yopiq kanal qo'shildi!*\n\n"
-        f"📢 Nomi: *{title_safe}*\n"
-        f"🆔 ID: `{save_ch_id}`\n"
-        f"🔗 Havola: {link_to_store}\n\n"
-        f"ℹ️ Endi bot foydalanuvchi a'zoligini Telegram API orqali *real vaqtda* "
-        f"tekshiradi va kerak bo'lganda har safar *yangi* taklif havolasi yaratadi — "
-        f"\"eskirgan havola\" xatosi endi chiqmaydi.",
-        parse_mode="Markdown",
-        reply_markup=admin_menu(message.from_user.id)
-    )
+    # Yopiq kanal (username yo'q): endi HAVOLANI ADMINDAN HAM SO'RAYMIZ —
+    # bot o'zining avtomatik yaratgan havolasiga yolg'iz ishonib qolmaydi.
+    # Shu tufayl "havola eskirgan" muammosi bartaraf etiladi.
+    await ask_backup_link(message, state, chat.id, can_invite, title, "📢 Yopiq kanal")
 
 @dp.callback_query(F.data == "chtype_instagram", AdminChannel.waiting_for_type)
 async def add_channel_type_instagram(call: types.CallbackQuery, state: FSMContext):
@@ -2077,7 +2167,9 @@ async def add_channel_manual_finish(message: types.Message, state: FSMContext):
     ch_id = f"{ch_type}_{int(datetime.now().timestamp())}"
     db = await get_db()
     await db.execute(
-        "INSERT INTO channels (channel_id, title, link, type) VALUES (?, ?, ?, ?)",
+        "INSERT INTO channels (channel_id, title, link, type) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET "
+        "title=excluded.title, link=excluded.link, type=excluded.type",
         (ch_id, title, link, ch_type)
     )
     await db.commit()
@@ -2460,10 +2552,8 @@ async def handle_join_request(join_request: types.ChatJoinRequest):
             f"\"✅ Tekshirish\" tugmasini bosing.",
             parse_mode="Markdown"
         )
-    except Exception:
-        pass
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Join-request foydalanuvchiga xabar yuborilmadi ({user.id}): {e}")
 
 
 # ─── COMMANDS ────────────────────────────────────────────────────────────────
