@@ -22,9 +22,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN =  "8632701533:AAG2dBXON0wLvsk6FisVzQAhlaHJ-o3FuEI"
-ADMIN_ID =  7825563654
-ADMIN_USERNAME = "Bexruzz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -1725,12 +1725,19 @@ async def ask_backup_link(
     chat_id_int: int, can_invite: bool, title: str, type_label: str
 ):
     """
-    Yopiq kanal uchun adminDAN taklif havolasini so'raydi. Bot o'zi
-    avtomatik havola yaratishga urinadi, lekin bunga ishonib qolmaymiz —
-    admin qo'lda bergan (haqiqiy, joriy) havola bo'lsa, aynan shu ishlatiladi.
-    Shu tufayl "havola eskirgan" muammosi bartaraf etiladi: agar botning
-    huquqi yetarli bo'lmasa yoki avtomatik havola biror sababdan ishlamasa,
-    adminning qo'lda bergan joriy havolasi zaxira sifatida saqlanadi.
+    Yopiq kanal uchun adminDAN taklif havolasini so'raydi.
+
+    MUHIM: /avto orqali bot yaratgan havola endi har doim
+    `creates_join_request=True` bilan yaratiladi — ya'ni shu havoladan
+    kirgan foydalanuvchi to'g'ridan-to'g'ri A'ZO BO'LMAYDI, balki
+    "qo'shilish so'rovi" yuboradi va admin buni qo'lda tasdiqlashi
+    kerak bo'ladi (aynan shuni admin so'ragan edi).
+
+    Agar admin havolani qo'lda (Telegramdan nusxalab) yuborsa — bu holda
+    o'sha havola qanday sozlab yaratilgan bo'lsa, xuddi shunday ishlaydi:
+    agar u yaratilganda "So'rov orqali qo'shish" yoqilmagan bo'lsa,
+    foydalanuvchi to'g'ridan-to'g'ri a'zo bo'lib ketadi. Shu sababli
+    quyida buni ochiq ogohlantiramiz va /avto ni tavsiya qilamiz.
     """
     await state.update_data(
         pending_chat_id=chat_id_int,
@@ -1742,91 +1749,27 @@ async def ask_backup_link(
 
     if can_invite:
         hint = (
-            "Bot o'zi ham avtomatik, eskirmaydigan taklif havolasi yarata oladi — "
-            "agar shunday bo'lishini istasangiz, /avto deb yozing."
+            "✅ *Tavsiya:* /avto deb yozing — bot o'zi \"qo'shilish so'rovi\" "
+            "talab qiladigan havola yaratadi (hech kim to'g'ridan-to'g'ri "
+            "a'zo bo'lolmaydi)."
         )
     else:
         hint = (
             "⚠️ *Diqqat:* botda hozircha \"Foydalanuvchilarni havola orqali "
-            "qo'shish\" huquqi yo'q — shu sabab bot o'zi avtomatik havola "
-            "yarata OLMAYDI. Havolani albatta qo'lda yuboring."
+            "qo'shish\" huquqi yo'q — shu sabab bot /avto havola yarata "
+            "OLMAYDI. Havolani albatta qo'lda yuboring."
         )
 
     await message.answer(
         f"🔗 *{md_escape(title)}* — yopiq kanal uchun taklif havolasini yuboring.\n\n"
-        "Buni Telegram'da: Kanal → Havolalar (Invite Links) bo'limidan olishingiz "
-        "mumkin, yoki botni admin qilib qo'shganingizda ko'rsatilgan havolani "
-        "yuboring.\n\n"
         f"{hint}\n\n"
+        "❗️ Agar havolani o'zingiz qo'lda yubormoqchi bo'lsangiz: Telegram'da "
+        "kanal → Havolalar (Invite Links) → \"Yangi havola yaratish\" → "
+        "*\"So'rov orqali qo'shish\"* (Request admin's approval) tugmasini "
+        "SHART yoqing — aks holda foydalanuvchi to'g'ridan-to'g'ri a'zo "
+        "bo'lib ketadi va \"qo'shilish so'rovi\" umuman ishlamaydi.\n\n"
         "Bekor qilish: /bekor",
         parse_mode="Markdown"
-    )
-
-
-@dp.message(AdminChannel.waiting_for_backup_link)
-async def add_channel_backup_link(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    chat_id_int = data.get("pending_chat_id")
-    title = data.get("pending_title") or ""
-    type_label = data.get("pending_type_label") or "📢 Kanal"
-    can_invite = bool(data.get("pending_can_invite"))
-
-    if chat_id_int is None:
-        await state.clear()
-        await message.answer(
-            "❌ Xatolik yuz berdi, qaytadan boshlang: \"📢 Kanal qo'shish\".",
-            reply_markup=admin_menu(message.from_user.id)
-        )
-        return
-
-    raw = (message.text or "").strip()
-    use_auto = raw.lower() in ("/avto", "avto", "/auto")
-
-    link = None
-    if not use_auto:
-        decoded = unquote(raw)
-        is_tme = any(
-            decoded.lower().startswith(p)
-            for p in ("https://t.me/", "http://t.me/", "t.me/")
-        )
-        if not is_tme:
-            extra = ", yoki /avto deb yozing." if can_invite else "."
-            await message.answer(
-                "❌ Bu to'g'ri taklif havolasiga o'xshamaydi.\n\n"
-                f"`https://t.me/+...` ko'rinishidagi havola yuboring{extra}\n\n"
-                "Bekor qilish: /bekor",
-                parse_mode="Markdown"
-            )
-            return
-        path = clean_tme_path(decoded)
-        link = "https://t.me/" + path
-
-    if link is None:
-        if not can_invite:
-            await message.answer(
-                "⛔ Botda taklif havolasi yaratish huquqi yo'q va siz ham "
-                "havola yubormadingiz.\n\nIltimos havolani qo'lda yuboring "
-                "yoki /bekor deb yozing.",
-                parse_mode="Markdown"
-            )
-            return
-        try:
-            invite = await asyncio.wait_for(
-                bot.create_chat_invite_link(chat_id_int),
-                timeout=API_TIMEOUT
-            )
-            link = invite.invite_link
-        except Exception as e:
-            logging.error(f"Invite link yaratib bo'lmadi ({chat_id_int}): {e}")
-            await message.answer(
-                f"❌ Avtomatik havola yaratib bo'lmadi: `{e}`\n\n"
-                "Iltimos havolani qo'lda yuboring yoki /bekor deb yozing.",
-                parse_mode="Markdown"
-            )
-            return
-
-    await save_telegram_channel(
-        message, state, str(chat_id_int), title, link, type_label
     )
 
 
@@ -2040,6 +1983,76 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=admin_menu(message.from_user.id)
         )
+
+@dp.message(AdminChannel.waiting_for_backup_link)
+async def add_channel_backup_link(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    chat_id_int = data.get("pending_chat_id")
+    title = data.get("pending_title") or ""
+    type_label = data.get("pending_type_label") or "📢 Kanal"
+    can_invite = bool(data.get("pending_can_invite"))
+
+    if chat_id_int is None:
+        await state.clear()
+        await message.answer(
+            "❌ Xatolik yuz berdi, qaytadan boshlang: \"📢 Kanal qo'shish\".",
+            reply_markup=admin_menu(message.from_user.id)
+        )
+        return
+
+    raw = (message.text or "").strip()
+    use_auto = raw.lower() in ("/avto", "avto", "/auto")
+
+    link = None
+    if not use_auto:
+        decoded = unquote(raw)
+        is_tme = any(
+            decoded.lower().startswith(p)
+            for p in ("https://t.me/", "http://t.me/", "t.me/")
+        )
+        if not is_tme:
+            extra = ", yoki /avto deb yozing." if can_invite else "."
+            await message.answer(
+                "❌ Bu to'g'ri taklif havolasiga o'xshamaydi.\n\n"
+                f"`https://t.me/+...` ko'rinishidagi havola yuboring{extra}\n\n"
+                "Bekor qilish: /bekor",
+                parse_mode="Markdown"
+            )
+            return
+        path = clean_tme_path(decoded)
+        link = "https://t.me/" + path
+
+    if link is None:
+        if not can_invite:
+            await message.answer(
+                "⛔ Botda taklif havolasi yaratish huquqi yo'q va siz ham "
+                "havola yubormadingiz.\n\nIltimos havolani qo'lda yuboring "
+                "yoki /bekor deb yozing.",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            invite = await asyncio.wait_for(
+                bot.create_chat_invite_link(
+                    chat_id_int,
+                    creates_join_request=True
+                ),
+                timeout=API_TIMEOUT
+            )
+            link = invite.invite_link
+        except Exception as e:
+            logging.error(f"Invite link yaratib bo'lmadi ({chat_id_int}): {e}")
+            await message.answer(
+                f"❌ Avtomatik havola yaratib bo'lmadi: `{e}`\n\n"
+                "Iltimos havolani qo'lda yuboring yoki /bekor deb yozing.",
+                parse_mode="Markdown"
+            )
+            return
+
+    await save_telegram_channel(
+        message, state, str(chat_id_int), title, link, type_label
+    )
+
 
 @dp.message(AdminChannel.waiting_for_invite_resolve)
 async def add_channel_invite_resolve(message: types.Message, state: FSMContext):
@@ -2294,7 +2307,10 @@ async def refresh_channel_link_cb(call: types.CallbackQuery):
 
     try:
         invite = await asyncio.wait_for(
-            bot.create_chat_invite_link(chat_id_int),
+            bot.create_chat_invite_link(
+                chat_id_int,
+                creates_join_request=True
+            ),
             timeout=API_TIMEOUT
         )
         new_link = invite.invite_link
