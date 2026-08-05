@@ -23,9 +23,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "8632701533:AAG00sDdQH5RgR3fV2y-WbyZp-txz18e3Ok"
-ADMIN_ID  = 7825563654
-ADMIN_USERNAME = "Bexruzz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -653,7 +653,7 @@ async def premium_checker():
                                 uid,
                                 f"⚠️ *Diqqat!* Premium obunangiz *{days_left} kun* ichida tugaydi.\n\n"
                                 f"📅 Tugash sanasi: *{expire.strftime('%d.%m.%Y')}*\n\n"
-                                f"Uzaytirish uchun @{ADMIN_USERNAME} bilan bog'laning.",
+                                f"Uzaytirish uchun @{md_escape(ADMIN_USERNAME)} bilan bog'laning.",
                                 parse_mode="Markdown"
                             )
                         except Exception:
@@ -915,11 +915,13 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
 
             cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(category, "🎬")
             silka = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
+            title_safe = md_escape(title)
+            code_safe = md_escape(code)
 
             caption = (
-                f"{cat_icon} {title}\n"
+                f"{cat_icon} {title_safe}\n"
                 f"📌 Qism: {part}\n"
-                f"🔑 Kod: {code}\n"
+                f"🔑 Kod: {code_safe}\n"
                 f"👁 Ko'rildi: {views:,} marta"
             )
             if not can_save:
@@ -929,7 +931,7 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
                     "📤 _Do'stlaringizga ulashish uchun quyidagi silkani yuboring:_"
                 )
             if silka:
-                caption += f"\n🔗 {silka}"
+                caption += f"\n🔗 {md_escape(silka)}"
 
             rating_kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
@@ -950,11 +952,13 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
             except Exception as e:
                 logging.error(f"Video yuborishda xato (media_id={media_id}, file_id={file_id}): {e}")
                 if user_is_admin:
+                    # Diagnostika xabari ATAYIN parse_mode'siz (oddiy matn)
+                    # yuboriladi — chunki xato matnining o'zida ham Markdown'ga
+                    # xalaqit beradigan belgilar bo'lishi mumkin.
                     await sendable.answer(
                         f"❌ '{title}' ({part}-qism) videoni yuborib bo'lmadi.\n\n"
-                        f"🛠 *Xato tafsiloti (faqat admin ko'radi):*\n`{e}`\n\n"
-                        f"🆔 media_id: `{media_id}`",
-                        parse_mode="Markdown"
+                        f"🛠 Xato tafsiloti (faqat admin ko'radi):\n{e}\n\n"
+                        f"🆔 media_id: {media_id}"
                     )
                 else:
                     await sendable.answer(f"❌ '{title}' videoni yuborib bo'lmadi.")
@@ -972,9 +976,7 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
         logging.error(f"deliver_media_by_code kutilmagan xato (code={code}, user={user_id}): {e}")
         try:
             if await is_bot_admin(user_id):
-                await sendable.answer(
-                    f"❌ Kutilmagan xato yuz berdi.\n\n🛠 `{e}`", parse_mode="Markdown"
-                )
+                await sendable.answer(f"❌ Kutilmagan xato yuz berdi.\n\n🛠 {e}")
             else:
                 await sendable.answer("❌ Xatolik yuz berdi. Birozdan so'ng qaytadan urinib ko'ring.")
         except Exception:
@@ -1295,7 +1297,7 @@ async def premium_info(message: types.Message):
         f"• Video saqlash va uzatish huquqi\n"
         f"• Majburiy kanal obunasisiz foydalanish\n\n"
         f"💰 *Narxi:* {price} so'm / {PREMIUM_DAYS} kun\n\n"
-        f"👨‍💻 *Admin:* @{ADMIN_USERNAME}\n\n"
+        f"👨‍💻 *Admin:* @{md_escape(ADMIN_USERNAME)}\n\n"
         f"To'lov usulini tanlang:",
         parse_mode="Markdown", reply_markup=kb
     )
@@ -1326,7 +1328,7 @@ async def req_premium_cb(call: types.CallbackQuery):
 @dp.callback_query(F.data == "pay_card")
 async def pay_card_cb(call: types.CallbackQuery, state: FSMContext):
     card_number, card_holder = await get_card_info()
-    holder_line = f"\n👤 *Karta egasi:* {card_holder}" if card_holder else ""
+    holder_line = f"\n👤 *Karta egasi:* {md_escape(card_holder)}" if card_holder else ""
     price = await get_premium_price(30)
     await state.set_state(PaymentReceipt.waiting_for_receipt)
     await call.message.answer(
@@ -1343,7 +1345,8 @@ async def pay_card_cb(call: types.CallbackQuery, state: FSMContext):
 @dp.message(PaymentReceipt.waiting_for_receipt, F.photo)
 async def receive_payment_receipt(message: types.Message, state: FSMContext):
     user = message.from_user
-    uname = f"@{user.username}" if user.username else "username yo'q"
+    uname = f"@{md_escape(user.username)}" if user.username else "username yo'q"
+    full_name_safe = md_escape(user.full_name)
     sent_time = datetime.now().strftime("%d.%m.%Y %H:%M")
     kb_admin = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -1359,7 +1362,7 @@ async def receive_payment_receipt(message: types.Message, state: FSMContext):
             photo=message.photo[-1].file_id,
             caption=(
                 f"🧾 *Yangi to'lov cheki!*\n\n"
-                f"👤 Ism: {user.full_name}\n"
+                f"👤 Ism: {full_name_safe}\n"
                 f"🔗 Username: {uname}\n"
                 f"🆔 ID: `{user.id}`\n"
                 f"🕒 Yuborilgan vaqt: {sent_time}\n\n"
@@ -1712,7 +1715,7 @@ async def process_manual_code(message: types.Message, state: FSMContext):
     )
     await state.set_state(MediaUpload.is_premium)
     await message.answer(
-        f"Kod: *{code}*\n\nKino turini tanlang:", reply_markup=kb, parse_mode="Markdown"
+        f"Kod: *{md_escape(code)}*\n\nKino turini tanlang:", reply_markup=kb, parse_mode="Markdown"
     )
 
 @dp.message(MediaUpload.is_premium)
@@ -1762,10 +1765,12 @@ async def process_video_upload(message: types.Message, state: FSMContext):
             data["category"], "🎬"
         )
         status_str = "🌟 Premium" if data["is_premium"] else "🌐 Oddiy"
+        title_safe = md_escape(data['title'])
+        code_safe = md_escape(data['code'])
         await message.answer(
             f"🎉 Barcha *{total_parts}* ta qism saqlandi!\n\n"
-            f"{cat_icon} *{data['title']}*\n"
-            f"🔑 Kod: `{data['code']}`\n"
+            f"{cat_icon} *{title_safe}*\n"
+            f"🔑 Kod: `{code_safe}`\n"
             f"📌 Turi: {status_str}",
             reply_markup=admin_menu(message.from_user.id), parse_mode="Markdown"
         )
@@ -1791,7 +1796,9 @@ async def delete_media_start(message: types.Message, state: FSMContext):
     for row in items:
         icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(row["category"], "🎬")
         prem = " 🌟" if row["is_premium"] else ""
-        text += f"{icon}{prem} {row['title']} — `{row['code']}`\n"
+        title_safe = md_escape(row['title'])
+        code_safe = md_escape(row['code'])
+        text += f"{icon}{prem} {title_safe} — `{code_safe}`\n"
     await message.answer(text, parse_mode="Markdown")
     await state.set_state(AdminDeleteMedia.waiting_for_code)
 
@@ -1810,7 +1817,7 @@ async def delete_media_finish(message: types.Message, state: FSMContext):
     await db.execute("DELETE FROM media WHERE code=?", (code,))
     await db.commit()
     await message.answer(
-        f"✅ *{row['title']}* (kod: `{code}`) o'chirildi.",
+        f"✅ *{md_escape(row['title'])}* (kod: `{md_escape(code)}`) o'chirildi.",
         reply_markup=admin_menu(message.from_user.id), parse_mode="Markdown"
     )
     await state.clear()
@@ -1842,7 +1849,7 @@ async def save_telegram_channel(
         f"🏷 Nomi: *{title_safe}*\n"
         f"📌 Turi: {type_label}\n"
         f"🆔 ID: `{save_ch_id}`\n"
-        f"🔗 Havola: {link}\n\n"
+        f"🔗 Havola: `{link}`\n\n"
         f"ℹ️ Yopiq kanal bo'lsa: bot qo'shilish so'rovlarini *avtomatik "
         f"tasdiqlamaydi* — admin qo'lda tasdiqlaydi. Lekin foydalanuvchi "
         f"so'rov yuborgani bilanoq botdan foydalanish uchun yetarli deb "
@@ -2105,11 +2112,12 @@ async def add_channel_get_id(message: types.Message, state: FSMContext):
         uname_safe = md_escape(uname) if uname else "yo'q"
         title_safe = md_escape(title)
         no_link = "_(yo'q)_"
+        link_display = f"`{link}`" if link else no_link
         await message.answer(
             f"✅ *Telegram bot qo'shildi!*\n\n"
             f"🤖 Nomi: *{title_safe}*\n"
             f"👤 Username: @{uname_safe}\n"
-            f"🔗 Havola: {link if link else no_link}\n\n"
+            f"🔗 Havola: {link_display}\n\n"
             f"ℹ️ Foydalanuvchilar botga o'tib, keyin "
             f"\"✅ Tekshirish\" tugmasini bosib tasdiqlaydi.",
             parse_mode="Markdown",
@@ -2324,7 +2332,7 @@ async def add_channel_manual_finish(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ *Havola qo'shildi!*\n\n"
         f"{icon} Nomi: *{title_safe}*\n"
-        f"🔗 {link}\n\n"
+        f"🔗 `{link}`\n\n"
         f"ℹ️ Foydalanuvchilar havolani ochib, \"✅ Tekshirish\" tugmasini bosib tasdiqlaydi.",
         parse_mode="Markdown",
         reply_markup=admin_menu(message.from_user.id)
@@ -2402,7 +2410,7 @@ async def list_channels(message: types.Message, state: FSMContext):
     refresh_buttons = []
     for ch in channels:
         icon = type_icons.get(ch["type"], "🔗")
-        link_str = ch["link"] if ch["link"] else "_(havola yo'q)_"
+        link_str = f"`{ch['link']}`" if ch["link"] else "_(havola yo'q)_"
         ch_id_str = md_escape(str(ch["channel_id"]))
         title_str = md_escape(ch["title"])
         text += (
@@ -2500,7 +2508,7 @@ async def start_card_change(message: types.Message, state: FSMContext):
         return
     await state.clear()
     card_number, card_holder = await get_card_info()
-    holder_line = f"\n👤 Hozirgi egasi: {card_holder}" if card_holder else ""
+    holder_line = f"\n👤 Hozirgi egasi: {md_escape(card_holder)}" if card_holder else ""
     await state.set_state(AdminCardChange.waiting_for_number)
     await message.answer(
         f"💳 Hozirgi karta raqami: `{card_number}`{holder_line}\n\n"
@@ -2525,7 +2533,7 @@ async def process_card_holder(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ Karta ma'lumotlari yangilandi!\n\n"
         f"💳 `{card_number}`\n"
-        f"👤 {card_holder}",
+        f"👤 {md_escape(card_holder)}",
         parse_mode="Markdown",
         reply_markup=admin_menu(message.from_user.id)
     )
@@ -2543,7 +2551,7 @@ async def admins_panel(message: types.Message, state: FSMContext):
     text += f"👑 Asosiy admin: `{ADMIN_ID}`\n\n"
     if admins:
         for row in admins:
-            uname_part = f"@{row['username']}" if row["username"] else "username yo'q"
+            uname_part = f"@{md_escape(row['username'])}" if row["username"] else "username yo'q"
             text += f"🔹 `{row['user_id']}` — {uname_part} ({row['added_at']})\n"
     else:
         text += "Qo'shimcha adminlar yo'q."
@@ -2818,8 +2826,7 @@ async def global_error_handler(event: types.ErrorEvent):
             if await is_bot_admin(chat_id):
                 await bot.send_message(
                     chat_id,
-                    f"❌ Kutilmagan xato yuz berdi.\n\n🛠 `{event.exception}`",
-                    parse_mode="Markdown"
+                    f"❌ Kutilmagan xato yuz berdi.\n\n🛠 {event.exception}"
                 )
             else:
                 await bot.send_message(
