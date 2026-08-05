@@ -23,9 +23,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+BOT_TOKEN =  "8632701533:AAGJyWb7CGTbjBs4LE3RFpDMcITxO8tB7h4"
+ADMIN_ID =  7825563654
+ADMIN_USERNAME = "Bexruzz"
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
