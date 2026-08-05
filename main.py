@@ -7,6 +7,7 @@ import aiosqlite
 from datetime import datetime, timedelta
 from urllib.parse import unquote, urlparse
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -23,9 +24,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN =  "8632701533:AAGJyWb7CGTbjBs4LE3RFpDMcITxO8tB7h4"
-ADMIN_ID =  7825563654
-ADMIN_USERNAME = "Bexruzz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -973,6 +974,10 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
         # ishlashda) kutilmagan xato chiqsa, foydalanuvchi hech qanday
         # javob olmay "hech narsa bo'lmagandek" qolib ketmasligi uchun bu
         # tashqi himoya qo'shildi.
+        # "query is too old" — muddati o'tgan callback query, jimgina o'tkazib yubor
+        if isinstance(e, TelegramBadRequest) and "query is too old" in str(e):
+            logging.warning(f"Muddati o'tgan callback query (code={code}, user={user_id})")
+            return
         logging.error(f"deliver_media_by_code kutilmagan xato (code={code}, user={user_id}): {e}")
         try:
             if await is_bot_admin(user_id):
@@ -2810,6 +2815,11 @@ async def global_error_handler(event: types.ErrorEvent):
     ham kamida log yoziladi va imkon bo'lsa foydalanuvchi/admin xabardor
     qilinadi.
     """
+    # "query is too old" — muddati o'tgan callback query, jimgina o'tkazib yubor
+    if isinstance(event.exception, TelegramBadRequest) and "query is too old" in str(event.exception):
+        logging.warning(f"Muddati o'tgan callback query e'tiborsiz qoldirildi: {event.exception}")
+        return
+
     logging.error(f"Global xato: {event.exception}", exc_info=event.exception)
     try:
         upd = event.update
