@@ -15,6 +15,7 @@ from aiogram.types import (
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import StorageKey
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,9 +23,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = ""
-ADMIN_ID = 7825563654
-ADMIN_USERNAME = "Bexruzz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -38,6 +39,36 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# ─── ASOSIY MENYU TUGMALARINI HAR DOIM DARHOL ISHLATISH ──────────────────────
+# Muammo: admin/foydalanuvchi biror bosqichda (masalan "📣 Xabar yuborish"
+# yoki "👥 Premium berish" kutayotgan holatda) turib, fikridan qaytib boshqa
+# asosiy menyu tugmasini bossa, matn ESKI bosqich handleriga tushib qolib
+# noto'g'ri ishlanardi — shu sabab "qotib qolgandek" bo'lib, ikkinchi marta
+# bosish kerak bo'lardi. Quyidagi middleware bu tugmalar bosilganda eskirgan
+# holatni DARHOL tozalaydi, shunda tugma birinchi bosishdayoq to'g'ri ishlaydi.
+MENU_INTERRUPT_TEXTS = {
+    "🎬 Kinolar", "📺 Seriallar", "⛩ Anime va Multfilm", "🔍 Kod orqali qidirish",
+    "➕ Kino/Serial/Anime qo'shish", "🗑 Kino/Serial/Anime o'chirish",
+    "📢 Kanal qo'shish", "🗑 Kanal o'chirish", "📋 Kanallar ro'yxati",
+    "👥 Premium berish", "❌ Premium olish", "📊 Premium ro'yxati",
+    "📊 Statistika", "📣 Xabar yuborish", "💰 Premium narxini o'zgartirish",
+    "💳 Karta raqamini o'zgartirish", "👨‍💼 Adminlar", "🗄 Zaxira olish",
+    "🏠 Bosh menyu",
+}
+# ("🌟 Premium" atayin bu ro'yxatga kiritilmagan — u kino qo'shish
+# bosqichida ham xuddi shu matn bilan ishlatiladi, holatni majburan
+# tozalash o'sha bosqichni buzib qo'yishi mumkin edi.)
+
+@dp.message.outer_middleware()
+async def menu_interrupt_middleware(handler, event: types.Message, data: dict):
+    text = event.text or ""
+    if text in MENU_INTERRUPT_TEXTS or text.startswith("/"):
+        key = StorageKey(bot_id=bot.id, chat_id=event.chat.id, user_id=event.from_user.id)
+        state = FSMContext(storage=dp.storage, key=key)
+        if await state.get_state() is not None:
+            await state.clear()
+    return await handler(event, data)
 
 _db: aiosqlite.Connection = None
 
@@ -634,6 +665,56 @@ async def backup_scheduler():
             logging.error(f"Zaxira yuborishda xato: {e}")
 
 
+async def refresh_private_channel_links():
+    """
+    Yopiq (raqamli ID) Telegram kanallar uchun bazada saqlangan taklif
+    havolasini YANGI havola bilan almashtiradi. Bu funksiya muntazam
+    (avtomatik) chaqiriladi — shunda foydalanuvchilarga hech qachon
+    eskirgan yoki bekor qilingan ("Expired Link") havola ko'rsatilmaydi,
+    admin qo'lda "🔄 Yangilash" tugmasini bosishini kutish shart bo'lmaydi.
+    Ochiq (@username) kanallarga tegilmaydi — ular eskirmaydi.
+    """
+    db = await get_db()
+    async with db.execute(
+        "SELECT channel_id FROM channels WHERE type='telegram'"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    for row in rows:
+        ch_id = row["channel_id"]
+        if str(ch_id).startswith("@"):
+            continue
+        try:
+            chat_id_int = int(ch_id)
+        except ValueError:
+            continue
+        try:
+            invite = await asyncio.wait_for(
+                bot.create_chat_invite_link(chat_id_int, creates_join_request=True),
+                timeout=API_TIMEOUT
+            )
+            await db.execute(
+                "UPDATE channels SET link=? WHERE channel_id=?",
+                (invite.invite_link, ch_id)
+            )
+            await db.commit()
+            logging.info(f"Kanal havolasi avtomatik yangilandi: {ch_id}")
+        except Exception as e:
+            logging.warning(f"Havolani avtomatik yangilab bo'lmadi ({ch_id}): {e}")
+
+async def link_refresh_scheduler():
+    """
+    Ishga tushganda darhol, so'ngra har 6 soatda bir marta barcha yopiq
+    kanallar havolasini yangilab turadi.
+    """
+    while True:
+        try:
+            await refresh_private_channel_links()
+        except Exception as e:
+            logging.error(f"link_refresh_scheduler xatosi: {e}")
+        await asyncio.sleep(6 * 3600)
+
+
 # ─── ZAXIRA OLISH ────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "🗄 Zaxira olish", StateFilter("*"))
@@ -785,8 +866,10 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
         await sendable.answer("❌ Bunday kodli kino, serial yoki anime topilmadi.")
         return
 
+    user_is_premium = await is_premium_user(user_id)
+
     is_prem_content = results[0]["is_premium"]
-    if is_prem_content and not await is_premium_user(user_id):
+    if is_prem_content and not user_is_premium:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌟 Premium olish", callback_data="req_premium")],
             [InlineKeyboardButton(
@@ -801,6 +884,12 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
         return
 
     user_is_admin = await is_bot_admin(user_id)
+    # Saqlash/boshqa joyga yuborish FAQAT Premium a'zolar va adminlarga ochiq.
+    # Oddiy foydalanuvchi uchun video himoyalanadi (protect_content=True) —
+    # lekin quyidagi silka/kod matn sifatida har doim ko'rinadi va ko'chirib
+    # olinadi, shu orqali kontent baribir tarqalishi mumkin, faqat videoning
+    # o'zi emas.
+    can_save = user_is_admin or user_is_premium
 
     for row in results:
         media_id = row["id"]
@@ -816,17 +905,22 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
         await db.commit()
 
         cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(category, "🎬")
+        silka = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
+
         caption = (
             f"{cat_icon} {title}\n"
             f"📌 Qism: {part}\n"
             f"🔑 Kod: {code}\n"
             f"👁 Ko'rildi: {views:,} marta"
         )
-        if not user_is_admin:
+        if not can_save:
             caption += (
-                "\n\n🔒 _Bu videoni saqlash yoki boshqa joyga uzatish uchun "
-                "🌟 Premium tarifga o'ting._"
+                "\n\n🔒 _Ushbu videoni saqlash yoki boshqa joyga yuborish faqat "
+                "🌟 Premium a'zolarga ochiq._\n"
+                "📤 _Do'stlaringizga ulashish uchun quyidagi silkani yuboring:_"
             )
+        if silka:
+            caption += f"\n🔗 {silka}"
 
         rating_kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -841,7 +935,7 @@ async def deliver_media_by_code(sendable, user_id: int, code: str):
                 video=file_id,
                 caption=caption,
                 parse_mode="Markdown",
-                protect_content=not user_is_admin,
+                protect_content=not can_save,
                 reply_markup=rating_kb
             )
         except Exception as e:
@@ -1479,7 +1573,7 @@ async def send_broadcast(message: types.Message, state: FSMContext):
     for row in all_users:
         uid = row["user_id"]
         try:
-            await message.copy_to(uid)
+            await message.copy_to(uid, protect_content=True)
             sent += 1
         except Exception:
             failed += 1
@@ -2684,6 +2778,7 @@ async def run_bot():
 
     asyncio.create_task(premium_checker())
     asyncio.create_task(backup_scheduler())
+    asyncio.create_task(link_refresh_scheduler())
 
     first_start = True
     while True:
