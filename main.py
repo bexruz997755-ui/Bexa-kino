@@ -23,9 +23,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "8632701533:AAG00sDdQH5RgR3fV2y-WbyZp-txz18e3Ok"
-ADMIN_ID =  7825563654
-ADMIN_USERNAME = "Bexruzz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -866,93 +866,119 @@ async def check_sub_cb(call: types.CallbackQuery):
 # ─── MEDIA YETKAZIB BERISH ───────────────────────────────────────────────────
 
 async def deliver_media_by_code(sendable, user_id: int, code: str):
-    db = await get_db()
-    async with db.execute(
-        "SELECT id, file_id, title, part, is_premium, category, views, likes, dislikes "
-        "FROM media WHERE code=? ORDER BY part ASC",
-        (code,)
-    ) as cur:
-        results = await cur.fetchall()
+    try:
+        db = await get_db()
+        async with db.execute(
+            "SELECT id, file_id, title, part, is_premium, category, views, likes, dislikes "
+            "FROM media WHERE code=? ORDER BY part ASC",
+            (code,)
+        ) as cur:
+            results = await cur.fetchall()
 
-    if not results:
-        await sendable.answer("❌ Bunday kodli kino, serial yoki anime topilmadi.")
-        return
+        if not results:
+            await sendable.answer("❌ Bunday kodli kino, serial yoki anime topilmadi.")
+            return
 
-    user_is_premium = await is_premium_user(user_id)
-
-    is_prem_content = results[0]["is_premium"]
-    if is_prem_content and not user_is_premium:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🌟 Premium olish", callback_data="req_premium")],
-            [InlineKeyboardButton(
-                text="👨‍💻 Admin bilan bog'lanish",
-                url=f"https://t.me/{ADMIN_USERNAME}"
-            )]
-        ])
-        await sendable.answer(
-            "🔒 Bu *Premium* kontent!\n\nTomosha qilish uchun premium a'zo bo'ling.",
-            reply_markup=kb, parse_mode="Markdown"
-        )
-        return
-
-    user_is_admin = await is_bot_admin(user_id)
-    # Saqlash/boshqa joyga yuborish FAQAT Premium a'zolar va adminlarga ochiq.
-    # Oddiy foydalanuvchi uchun video himoyalanadi (protect_content=True) —
-    # lekin quyidagi silka/kod matn sifatida har doim ko'rinadi va ko'chirib
-    # olinadi, shu orqali kontent baribir tarqalishi mumkin, faqat videoning
-    # o'zi emas.
-    can_save = user_is_admin or user_is_premium
-
-    for row in results:
-        media_id = row["id"]
-        file_id = row["file_id"]
-        title = row["title"]
-        part = row["part"]
-        category = row["category"]
-        views = (row["views"] or 0) + 1
-        likes = row["likes"] or 0
-        dislikes = row["dislikes"] or 0
-
-        await db.execute("UPDATE media SET views=? WHERE id=?", (views, media_id))
-        await db.commit()
-
-        cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(category, "🎬")
-        silka = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
-
-        caption = (
-            f"{cat_icon} {title}\n"
-            f"📌 Qism: {part}\n"
-            f"🔑 Kod: {code}\n"
-            f"👁 Ko'rildi: {views:,} marta"
-        )
-        if not can_save:
-            caption += (
-                "\n\n🔒 _Ushbu videoni saqlash yoki boshqa joyga yuborish faqat "
-                "🌟 Premium a'zolarga ochiq._\n"
-                "📤 _Do'stlaringizga ulashish uchun quyidagi silkani yuboring:_"
+        is_prem_content = results[0]["is_premium"]
+        if is_prem_content and not await is_premium_user(user_id):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌟 Premium olish", callback_data="req_premium")],
+                [InlineKeyboardButton(
+                    text="👨‍💻 Admin bilan bog'lanish",
+                    url=f"https://t.me/{ADMIN_USERNAME}"
+                )]
+            ])
+            await sendable.answer(
+                "🔒 Bu *Premium* kontent!\n\nTomosha qilish uchun premium a'zo bo'ling.",
+                reply_markup=kb, parse_mode="Markdown"
             )
-        if silka:
-            caption += f"\n🔗 {silka}"
+            return
 
-        rating_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"👍 {likes}", callback_data=f"vote_{media_id}_1"
-            ),
-            InlineKeyboardButton(
-                text=f"👎 {dislikes}", callback_data=f"vote_{media_id}_0"
-            ),
-        ]])
+        user_is_admin = await is_bot_admin(user_id)
+        # Saqlash/boshqa joyga yuborish FAQAT adminlarga ochiq — Premium
+        # a'zolar ham (oddiy foydalanuvchi kabi) videoni saqlay olmaydi,
+        # faqat pastdagi silka orqali ulashishi mumkin.
+        can_save = user_is_admin
+
+        for row in results:
+            media_id = row["id"]
+            file_id = row["file_id"]
+            title = row["title"]
+            part = row["part"]
+            category = row["category"]
+            views = (row["views"] or 0) + 1
+            likes = row["likes"] or 0
+            dislikes = row["dislikes"] or 0
+
+            await db.execute("UPDATE media SET views=? WHERE id=?", (views, media_id))
+            await db.commit()
+
+            cat_icon = {"kino": "🎬", "serial": "📺", "anime": "⛩"}.get(category, "🎬")
+            silka = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
+
+            caption = (
+                f"{cat_icon} {title}\n"
+                f"📌 Qism: {part}\n"
+                f"🔑 Kod: {code}\n"
+                f"👁 Ko'rildi: {views:,} marta"
+            )
+            if not can_save:
+                caption += (
+                    "\n\n🔒 _Ushbu videoni saqlash yoki boshqa joyga yuborish "
+                    "mumkin emas._\n"
+                    "📤 _Do'stlaringizga ulashish uchun quyidagi silkani yuboring:_"
+                )
+            if silka:
+                caption += f"\n🔗 {silka}"
+
+            rating_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=f"👍 {likes}", callback_data=f"vote_{media_id}_1"
+                ),
+                InlineKeyboardButton(
+                    text=f"👎 {dislikes}", callback_data=f"vote_{media_id}_0"
+                ),
+            ]])
+            try:
+                await sendable.answer_video(
+                    video=file_id,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    protect_content=not can_save,
+                    reply_markup=rating_kb
+                )
+            except Exception as e:
+                logging.error(f"Video yuborishda xato (media_id={media_id}, file_id={file_id}): {e}")
+                if user_is_admin:
+                    await sendable.answer(
+                        f"❌ '{title}' ({part}-qism) videoni yuborib bo'lmadi.\n\n"
+                        f"🛠 *Xato tafsiloti (faqat admin ko'radi):*\n`{e}`\n\n"
+                        f"🆔 media_id: `{media_id}`",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await sendable.answer(f"❌ '{title}' videoni yuborib bo'lmadi.")
+
+            # Telegram tezlik cheklovi (flood control)ga urilmaslik uchun —
+            # bir nechta qismni ketma-ket yuborganda kichik tanaffus.
+            await asyncio.sleep(0.4)
+
+    except Exception as e:
+        # Yuqoridagi ichki try/except faqat video yuborish xatolarini
+        # ushlaydi. Agar funksiyaning boshqa qismida (masalan baza bilan
+        # ishlashda) kutilmagan xato chiqsa, foydalanuvchi hech qanday
+        # javob olmay "hech narsa bo'lmagandek" qolib ketmasligi uchun bu
+        # tashqi himoya qo'shildi.
+        logging.error(f"deliver_media_by_code kutilmagan xato (code={code}, user={user_id}): {e}")
         try:
-            await sendable.answer_video(
-                video=file_id,
-                caption=caption,
-                parse_mode="Markdown",
-                protect_content=not can_save,
-                reply_markup=rating_kb
-            )
-        except Exception as e:
-            logging.error(f"Video yuborishda xato (media_id={media_id}): {e}")
-            await sendable.answer(f"❌ '{title}' videoni yuborib bo'lmadi.")
+            if await is_bot_admin(user_id):
+                await sendable.answer(
+                    f"❌ Kutilmagan xato yuz berdi.\n\n🛠 `{e}`", parse_mode="Markdown"
+                )
+            else:
+                await sendable.answer("❌ Xatolik yuz berdi. Birozdan so'ng qaytadan urinib ko'ring.")
+        except Exception:
+            pass
 
 
 # ─── RO'YXATLAR ──────────────────────────────────────────────────────────────
@@ -2765,6 +2791,43 @@ async def set_commands():
         )
     except Exception as e:
         logging.warning(f"Admin buyruqlari o'rnatilmadi: {e}")
+
+@dp.errors()
+async def global_error_handler(event: types.ErrorEvent):
+    """
+    Har qanday handlerda ushlanmagan kutilmagan xato shu yerga tushadi.
+    Buning yo'qligi sabab, ilgari ba'zi xatolar foydalanuvchiga HECH
+    QANDAY javob bermay, "sukut bilan" yo'qolib ketardi (masalan tugma
+    bosilganda hech narsa bo'lmagandek tuyulishi). Endi bunday holatda
+    ham kamida log yoziladi va imkon bo'lsa foydalanuvchi/admin xabardor
+    qilinadi.
+    """
+    logging.error(f"Global xato: {event.exception}", exc_info=event.exception)
+    try:
+        upd = event.update
+        chat_id = None
+        if upd.message:
+            chat_id = upd.message.chat.id
+        elif upd.callback_query and upd.callback_query.message:
+            chat_id = upd.callback_query.message.chat.id
+            try:
+                await upd.callback_query.answer("❌ Xatolik yuz berdi.", show_alert=True)
+            except Exception:
+                pass
+        if chat_id:
+            if await is_bot_admin(chat_id):
+                await bot.send_message(
+                    chat_id,
+                    f"❌ Kutilmagan xato yuz berdi.\n\n🛠 `{event.exception}`",
+                    parse_mode="Markdown"
+                )
+            else:
+                await bot.send_message(
+                    chat_id, "❌ Xatolik yuz berdi. Birozdan so'ng qaytadan urinib ko'ring."
+                )
+    except Exception:
+        pass
+
 
 async def run_bot():
     global BOT_USERNAME
