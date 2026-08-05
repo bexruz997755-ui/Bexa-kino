@@ -23,9 +23,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-BOT_TOKEN = "8632701533:AAG00sDdQH5RgR3fV2y-WbyZp-txz18e3Ok"
-ADMIN_ID =  7825563654
-ADMIN_USERNAME = "Bexruzz"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PREMIUM_DAYS = 30
 NOTIFY_BEFORE_DAYS = 3
 PAGE_SIZE = 10
@@ -60,10 +60,22 @@ MENU_INTERRUPT_TEXTS = {
 # bosqichida ham xuddi shu matn bilan ishlatiladi, holatni majburan
 # tozalash o'sha bosqichni buzib qo'yishi mumkin edi.)
 
+# Botda HAQIQATDA ro'yxatga olingan buyruqlar (pastdagi set_my_commands
+# ro'yxatiga mos). "/avto" kabi so'zlar bu yerga KIRMAYDI — ular haqiqiy
+# bot buyrug'i emas, balki muayyan bosqichda kutilayotgan maxsus matn
+# (masalan AdminChannel.waiting_for_backup_link), shu sabab ularni
+# umumiy "/" bilan boshlanuvchi buyruq deb hisoblab bo'lmaydi — aks holda
+# holat noto'g'ri tozalanib, o'sha maxsus so'z ishlamay qolardi.
+REAL_BOT_COMMANDS = {
+    "/start", "/kino", "/serial", "/anime",
+    "/search", "/premium", "/admin", "/bekor",
+}
+
 @dp.message.outer_middleware()
 async def menu_interrupt_middleware(handler, event: types.Message, data: dict):
     text = event.text or ""
-    if text in MENU_INTERRUPT_TEXTS or text.startswith("/"):
+    command_word = text.split()[0].lower() if text else ""
+    if text in MENU_INTERRUPT_TEXTS or command_word in REAL_BOT_COMMANDS:
         key = StorageKey(bot_id=bot.id, chat_id=event.chat.id, user_id=event.from_user.id)
         state = FSMContext(storage=dp.storage, key=key)
         if await state.get_state() is not None:
